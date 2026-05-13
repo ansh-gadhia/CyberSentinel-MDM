@@ -1,0 +1,275 @@
+# CyberSentinel MDM — Virtual Galaxy Infotech Ltd
+# Production-grade compose for local development. For prod, see k8s/.
+# Networks: every service joins `mdm` so they resolve each other by name.
+
+x-go-env: &go-env
+  POSTGRES_DSN: postgres://mdm:${POSTGRES_PASSWORD:-mdm}@postgres:5432/mdm?sslmode=disable
+  REDIS_ADDR: redis:6379
+  NATS_URL: nats://nats:4222
+  MQTT_BROKER: tcp://mosquitto:1883
+  MQTT_USER: ${MQTT_USER:-mdm}
+  MQTT_PASS: ${MQTT_PASS:-mdmpass}
+  MINIO_ENDPOINT: minio:9000
+  MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
+  MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
+  JWT_SECRET: ${JWT_SECRET:-please-change-this-in-prod-32-bytes-min}
+  JWT_ACCESS_TTL: "15m"
+  JWT_REFRESH_TTL: "168h"
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  ENV: ${ENV:-development}
+
+services:
+
+  # ------------------------------ infrastructure ------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mdm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mdm}
+      POSTGRES_DB: mdm
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./infra/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mdm -d mdm"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks: [mdm]
+    ports: ["5432:5432"]
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+    networks: [mdm]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    networks: [mdm]
+    ports: ["4222:4222", "8222:8222"]
+
+  mosquitto:
+    image: eclipse-mosquitto:2
+    volumes:
+      - ./infra/mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+    ports: ["1883:1883", "9001:9001"]
+    networks: [mdm]
+
+  minio:
+    image: minio/minio:latest
+    # Console moved off 9001 because mosquitto MQTT-over-WS already binds it.
+    command: server /data --console-address ":9101"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-minioadmin}
+    volumes:
+      - minio-data:/data
+    ports: ["9000:9000", "9101:9101"]
+    networks: [mdm]
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    networks: [mdm]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3001:3000"]
+    networks: [mdm]
+
+  # ------------------------------- gateway -----------------------------------
+
+  traefik:
+    image: traefik:v3.1
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedByDefault=false
+      - --providers.docker.network=server_mdm
+      - --entrypoints.web.address=:80
+      - --entrypoints.websecure.address=:443
+      - --api.dashboard=true
+      - --api.insecure=true
+      - --metrics.prometheus=true
+    environment:
+      # The daemon API on this host (29.x) requires API v1.40+; pin so the
+      # docker client inside traefik doesn't fall back to a stale default.
+      DOCKER_API_VERSION: "1.43"
+    ports:
+      # Traefik no longer binds host :80 here — the host's Docker daemon
+      # rejects Traefik's docker-client API version, so service discovery
+      # is broken and any request that lands on Traefik gets `404 page not
+      # found`. Admin-web nginx takes :80 instead (see below) so the agent's
+      # default URL (`http://<host>`, no port) just works.
+      - "8081:8080"   # traefik dashboard
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks: [mdm]
+
+  # ------------------------------- services ----------------------------------
+
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: auth-service
+      HTTP_PORT: "8001"
+    depends_on:
+      postgres: {condition: service_healthy}
+      redis:    {condition: service_started}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.auth.rule=PathPrefix(`/api/v1/auth`)
+      - traefik.http.services.auth.loadbalancer.server.port=8001
+    networks: [mdm]
+
+  device-service:
+    build:
+      context: .
+      dockerfile: device-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: device-service
+      HTTP_PORT: "8002"
+    depends_on:
+      postgres: {condition: service_healthy}
+      nats:     {condition: service_started}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.device.rule=PathPrefix(`/api/v1/devices`) || PathPrefix(`/api/v1/enroll`)
+      - traefik.http.services.device.loadbalancer.server.port=8002
+    networks: [mdm]
+
+  policy-service:
+    build:
+      context: .
+      dockerfile: policy-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: policy-service
+      HTTP_PORT: "8003"
+    depends_on:
+      postgres: {condition: service_healthy}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.policy.rule=PathPrefix(`/api/v1/policies`)
+      - traefik.http.services.policy.loadbalancer.server.port=8003
+    networks: [mdm]
+
+  command-service:
+    build:
+      context: .
+      dockerfile: command-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: command-service
+      HTTP_PORT: "8004"
+    depends_on:
+      postgres:  {condition: service_healthy}
+      nats:      {condition: service_started}
+      mosquitto: {condition: service_started}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.command.rule=PathPrefix(`/api/v1/commands`)
+      - traefik.http.services.command.loadbalancer.server.port=8004
+    networks: [mdm]
+
+  telemetry-service:
+    build:
+      context: .
+      dockerfile: telemetry-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: telemetry-service
+      HTTP_PORT: "8005"
+    depends_on:
+      postgres: {condition: service_healthy}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.telemetry.rule=PathPrefix(`/api/v1/telemetry`)
+      - traefik.http.services.telemetry.loadbalancer.server.port=8005
+    networks: [mdm]
+
+  notification-service:
+    build:
+      context: .
+      dockerfile: notification-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: notification-service
+      HTTP_PORT: "8006"
+    depends_on:
+      mosquitto: {condition: service_started}
+      nats:      {condition: service_started}
+    networks: [mdm]
+
+  file-service:
+    build:
+      context: .
+      dockerfile: file-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: file-service
+      HTTP_PORT: "8007"
+    depends_on:
+      minio:    {condition: service_started}
+      postgres: {condition: service_healthy}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.file.rule=PathPrefix(`/api/v1/files`)
+      - traefik.http.services.file.loadbalancer.server.port=8007
+    networks: [mdm]
+
+  audit-service:
+    build:
+      context: .
+      dockerfile: audit-service/Dockerfile
+    environment:
+      <<: *go-env
+      SERVICE_NAME: audit-service
+      HTTP_PORT: "8008"
+    depends_on:
+      postgres: {condition: service_healthy}
+    labels:
+      - traefik.enable=true
+      - traefik.http.routers.audit.rule=PathPrefix(`/api/v1/audit`)
+      - traefik.http.services.audit.loadbalancer.server.port=8008
+    networks: [mdm]
+
+  admin-web:
+    build:
+      context: ./admin-web
+      dockerfile: Dockerfile
+    # Bind to both :80 (so the agent's plain `http://<host>` URL works)
+    # and :8080 (legacy port some users have bookmarked).
+    ports: ["80:80", "8080:80"]
+    depends_on: [auth-service, device-service]
+    networks: [mdm]
+
+volumes:
+  postgres-data:
+  redis-data:
+  mosquitto-data:
+  minio-data:
+  grafana-data:
+
+networks:
+  mdm:
+    driver: bridge

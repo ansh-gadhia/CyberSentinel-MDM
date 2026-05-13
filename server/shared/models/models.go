@@ -1,0 +1,207 @@
+// Package models holds the canonical domain types shared across services.
+//
+// These structs are deliberately kept simple: persistence-layer concerns
+// (foreign key columns, soft-delete columns) live alongside business fields
+// because every service reads/writes the same Postgres schema.
+package models
+
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// ----------------- Tenant ----------------------------------------------------
+
+type Tenant struct {
+	ID        uuid.UUID  `db:"id" json:"id"`
+	Slug      string     `db:"slug" json:"slug"`
+	Name      string     `db:"name" json:"name"`
+	CreatedAt time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt time.Time  `db:"updated_at" json:"updated_at"`
+	DeletedAt *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+// ----------------- User / RBAC -----------------------------------------------
+
+type Role string
+
+const (
+	RoleSuperAdmin Role = "super_admin"
+	RoleAdmin      Role = "admin"
+	RoleOperator   Role = "operator"
+	RoleViewer     Role = "viewer"
+)
+
+type User struct {
+	ID           uuid.UUID  `db:"id" json:"id"`
+	TenantID     uuid.UUID  `db:"tenant_id" json:"tenant_id"`
+	Email        string     `db:"email" json:"email"`
+	PasswordHash string     `db:"password_hash" json:"-"`
+	Role         Role       `db:"role" json:"role"`
+	MFAEnabled   bool       `db:"mfa_enabled" json:"mfa_enabled"`
+	MFASecret    *string    `db:"mfa_secret" json:"-"`
+	LastLoginAt  *time.Time `db:"last_login_at" json:"last_login_at,omitempty"`
+	CreatedAt    time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt    time.Time  `db:"updated_at" json:"updated_at"`
+	DeletedAt    *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+type RefreshToken struct {
+	ID         uuid.UUID  `db:"id"`
+	TenantID   uuid.UUID  `db:"tenant_id"`
+	SubjectID  uuid.UUID  `db:"subject_id"` // user_id or device_id
+	Kind       string     `db:"kind"`       // "user" | "device"
+	TokenHash  string     `db:"token_hash"`
+	IssuedAt   time.Time  `db:"issued_at"`
+	ExpiresAt  time.Time  `db:"expires_at"`
+	RevokedAt  *time.Time `db:"revoked_at"`
+	ReplacedBy *uuid.UUID `db:"replaced_by"`
+	UserAgent  *string    `db:"user_agent"`
+	IPAddr     *string    `db:"ip_addr"`
+}
+
+// ----------------- Device -----------------------------------------------------
+
+type DeviceState string
+
+const (
+	DeviceStatePending    DeviceState = "pending"     // enrollment token issued, not yet checked in
+	DeviceStateEnrolled   DeviceState = "enrolled"    // active
+	DeviceStateOffline    DeviceState = "offline"     // missed heartbeats
+	DeviceStateWiped      DeviceState = "wiped"       // wipe acknowledged
+	DeviceStateRetired    DeviceState = "retired"     // soft retired
+)
+
+type Device struct {
+	ID                  uuid.UUID       `db:"id" json:"id"`
+	TenantID            uuid.UUID       `db:"tenant_id" json:"tenant_id"`
+	EnrollmentTokenID   *uuid.UUID      `db:"enrollment_token_id" json:"enrollment_token_id,omitempty"`
+	SerialNumber        *string         `db:"serial_number" json:"serial_number,omitempty"`
+	IMEI                *string         `db:"imei" json:"imei,omitempty"`
+	AndroidID           *string         `db:"android_id" json:"android_id,omitempty"`
+	Manufacturer        *string         `db:"manufacturer" json:"manufacturer,omitempty"`
+	Model               *string         `db:"model" json:"model,omitempty"`
+	OSVersion           *string         `db:"os_version" json:"os_version,omitempty"`
+	SecurityPatchLevel  *string         `db:"security_patch_level" json:"security_patch_level,omitempty"`
+	State               DeviceState     `db:"state" json:"state"`
+	LastHeartbeatAt     *time.Time      `db:"last_heartbeat_at" json:"last_heartbeat_at,omitempty"`
+	AssignedPolicyID    *uuid.UUID      `db:"assigned_policy_id" json:"assigned_policy_id,omitempty"`
+	AppliedPolicyVer    int             `db:"applied_policy_version" json:"applied_policy_version"`
+	GroupID             *uuid.UUID      `db:"group_id" json:"group_id,omitempty"`
+	Tags                json.RawMessage `db:"tags" json:"tags,omitempty"`
+	Metadata            json.RawMessage `db:"metadata" json:"metadata,omitempty"`
+	CreatedAt           time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt           time.Time       `db:"updated_at" json:"updated_at"`
+	DeletedAt           *time.Time      `db:"deleted_at" json:"deleted_at,omitempty"`
+	Version             int             `db:"version" json:"version"` // optimistic locking
+}
+
+// ----------------- Enrollment Token ------------------------------------------
+
+type EnrollmentToken struct {
+	ID         uuid.UUID  `db:"id" json:"id"`
+	TenantID   uuid.UUID  `db:"tenant_id" json:"tenant_id"`
+	PolicyID   *uuid.UUID `db:"policy_id" json:"policy_id,omitempty"`
+	Token      string     `db:"token" json:"token"`
+	OneShot    bool       `db:"one_shot" json:"one_shot"`
+	UsedCount  int        `db:"used_count" json:"used_count"`
+	MaxUses    int        `db:"max_uses" json:"max_uses"`
+	ExpiresAt  time.Time  `db:"expires_at" json:"expires_at"`
+	CreatedBy  uuid.UUID  `db:"created_by" json:"created_by"`
+	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
+}
+
+// ----------------- Policy ----------------------------------------------------
+
+type Policy struct {
+	ID         uuid.UUID       `db:"id" json:"id"`
+	TenantID   uuid.UUID       `db:"tenant_id" json:"tenant_id"`
+	Name       string          `db:"name" json:"name"`
+	Version    int             `db:"version" json:"version"`
+	Spec       json.RawMessage `db:"spec" json:"spec"` // full PolicySpec JSON; see android-agent/policy-engine
+	CreatedBy  uuid.UUID       `db:"created_by" json:"created_by"`
+	CreatedAt  time.Time       `db:"created_at" json:"created_at"`
+	UpdatedAt  time.Time       `db:"updated_at" json:"updated_at"`
+	DeletedAt  *time.Time      `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+// ----------------- Command ---------------------------------------------------
+
+type CommandState string
+
+const (
+	CommandStatePending      CommandState = "pending"
+	CommandStateDispatched   CommandState = "dispatched"
+	CommandStateAcknowledged CommandState = "acknowledged"
+	CommandStateSucceeded    CommandState = "succeeded"
+	CommandStateFailed       CommandState = "failed"
+	CommandStateTimedOut     CommandState = "timed_out"
+)
+
+type Command struct {
+	ID            uuid.UUID       `db:"id" json:"id"`
+	TenantID      uuid.UUID       `db:"tenant_id" json:"tenant_id"`
+	DeviceID      uuid.UUID       `db:"device_id" json:"device_id"`
+	Kind          string          `db:"kind" json:"kind"`        // LOCK, WIPE, REBOOT, INSTALL_APK, ...
+	Payload       json.RawMessage `db:"payload" json:"payload"`
+	State         CommandState    `db:"state" json:"state"`
+	Attempts      int             `db:"attempts" json:"attempts"`
+	MaxAttempts   int             `db:"max_attempts" json:"max_attempts"`
+	LastError     *string         `db:"last_error" json:"last_error,omitempty"`
+	// Pointer so a NULL row scans cleanly. Without this database/sql refuses
+	// to materialise NULL into a non-pointer json.RawMessage and we get
+	// "unsupported Scan, storing driver.Value type <nil> into type *json.RawMessage".
+	Result        *json.RawMessage `db:"result" json:"result,omitempty"`
+	DispatchedAt  *time.Time      `db:"dispatched_at" json:"dispatched_at,omitempty"`
+	AckedAt       *time.Time      `db:"acked_at" json:"acked_at,omitempty"`
+	CompletedAt   *time.Time      `db:"completed_at" json:"completed_at,omitempty"`
+	TimeoutAt     time.Time       `db:"timeout_at" json:"timeout_at"`
+	CreatedBy     uuid.UUID       `db:"created_by" json:"created_by"`
+	CreatedAt     time.Time       `db:"created_at" json:"created_at"`
+}
+
+// ----------------- Telemetry --------------------------------------------------
+
+type TelemetryEvent struct {
+	ID        uuid.UUID       `db:"id" json:"id"`
+	TenantID  uuid.UUID       `db:"tenant_id" json:"tenant_id"`
+	DeviceID  uuid.UUID       `db:"device_id" json:"device_id"`
+	Kind      string          `db:"kind" json:"kind"`
+	Payload   json.RawMessage `db:"payload" json:"payload"`
+	CapturedAt time.Time      `db:"captured_at" json:"captured_at"`
+	ReceivedAt time.Time      `db:"received_at" json:"received_at"`
+}
+
+// ----------------- File ------------------------------------------------------
+
+type FileObject struct {
+	ID          uuid.UUID  `db:"id" json:"id"`
+	TenantID    uuid.UUID  `db:"tenant_id" json:"tenant_id"`
+	Name        string     `db:"name" json:"name"`
+	Kind        string     `db:"kind" json:"kind"` // "apk", "log", "generic"
+	StorageKey  string     `db:"storage_key" json:"storage_key"`
+	SHA256      string     `db:"sha256" json:"sha256"`
+	SizeBytes   int64      `db:"size_bytes" json:"size_bytes"`
+	ContentType string     `db:"content_type" json:"content_type"`
+	UploadedBy  uuid.UUID  `db:"uploaded_by" json:"uploaded_by"`
+	CreatedAt   time.Time  `db:"created_at" json:"created_at"`
+	DeletedAt   *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+// ----------------- Audit -----------------------------------------------------
+
+type AuditEntry struct {
+	ID         uuid.UUID       `db:"id" json:"id"`
+	TenantID   uuid.UUID       `db:"tenant_id" json:"tenant_id"`
+	ActorID    *uuid.UUID      `db:"actor_id" json:"actor_id,omitempty"`
+	ActorKind  string          `db:"actor_kind" json:"actor_kind"` // "user" | "device" | "system"
+	Action     string          `db:"action" json:"action"`
+	TargetKind *string         `db:"target_kind" json:"target_kind,omitempty"`
+	TargetID   *uuid.UUID      `db:"target_id" json:"target_id,omitempty"`
+	Metadata   json.RawMessage `db:"metadata" json:"metadata,omitempty"`
+	PrevHash   string          `db:"prev_hash" json:"prev_hash"`
+	Hash       string          `db:"hash" json:"hash"`
+	CreatedAt  time.Time       `db:"created_at" json:"created_at"`
+}

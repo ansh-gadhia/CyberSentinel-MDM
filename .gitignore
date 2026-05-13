@@ -1,0 +1,61 @@
+# Claude
+.claude/
+**/.claude/
+
+# Android build output
+android-agent/**/build/
+android-agent/**/.gradle/
+android-agent/.gradle/
+android-agent/local.properties
+android-agent/captures/
+android-agent/.idea/
+android-agent/*.iml
+android-agent/**/*.iml
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.keystore
+*.jks
+
+# Gradle wrapper jar (regenerated)
+android-agent/gradle/wrapper/gradle-wrapper.jar
+
+# Go build artifacts
+server/**/bin/
+server/**/*.exe
+server/**/*.test
+server/**/*.out
+
+# Node / admin-web
+server/admin-web/node_modules/
+server/admin-web/dist/
+server/admin-web/.vite/
+server/admin-web/npm-debug.log*
+
+# Docker / runtime data
+server/data/
+server/**/data/
+**/postgres-data/
+**/minio-data/
+**/mosquitto-data/
+
+# Env / secrets
+.env
+.env.*
+*.pem
+*.key
+*.crt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/

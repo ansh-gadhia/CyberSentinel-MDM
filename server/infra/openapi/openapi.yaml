@@ -1,0 +1,160 @@
+openapi: 3.0.3
+info:
+  title: MDM Platform API
+  version: 1.0.0
+  description: |
+    Public API surface exposed via the gateway. All endpoints under /api/v1/.
+    Auth: Bearer JWT. Two token kinds (claim `knd`):
+      - `user`   for admin/operator humans
+      - `device` for enrolled devices
+servers:
+  - url: https://mdm.example.com
+    description: Production
+  - url: http://localhost
+    description: Local
+
+components:
+  securitySchemes:
+    bearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  schemas:
+    Device:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        tenant_id: { type: string, format: uuid }
+        serial_number: { type: string }
+        model: { type: string }
+        manufacturer: { type: string }
+        os_version: { type: string }
+        state: { type: string, enum: [pending, enrolled, offline, wiped, retired] }
+        last_heartbeat_at: { type: string, format: date-time }
+        applied_policy_version: { type: integer }
+    Policy:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        version: { type: integer }
+        spec: { type: object, additionalProperties: true }
+    Command:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        device_id: { type: string, format: uuid }
+        kind: { type: string }
+        state:
+          type: string
+          enum: [pending, dispatched, acknowledged, succeeded, failed, timed_out]
+        payload: { type: object, additionalProperties: true }
+        result: { type: object, additionalProperties: true }
+        attempts: { type: integer }
+        max_attempts: { type: integer }
+
+security:
+  - bearer: []
+
+paths:
+  /api/v1/auth/login:
+    post:
+      summary: Exchange credentials for an access + refresh token pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string }
+                password: { type: string }
+                mfa_code: { type: string }
+      responses:
+        "200":
+          description: token pair
+  /api/v1/auth/refresh:
+    post:
+      summary: Rotate refresh token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties: { refresh_token: { type: string } }
+      responses:
+        "200": { description: rotated pair }
+
+  /api/v1/enroll/tokens:
+    post:
+      summary: Admin — create an enrollment token (and its QR payload URL)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                policy_id: { type: string, nullable: true }
+                one_shot: { type: boolean }
+                max_uses: { type: integer }
+                expires_in: { type: string, example: "24h" }
+      responses:
+        "201": { description: created }
+  /api/v1/enroll/qr/{tokenID}:
+    get:
+      summary: QR payload (JSON encoded into the QR image)
+      security: []
+      parameters: [{ name: tokenID, in: path, required: true, schema: { type: string }}]
+      responses: { "200": { description: ok } }
+  /api/v1/enroll:
+    post:
+      summary: Device — exchange enrollment token for device credentials
+      security: []
+
+  /api/v1/devices:
+    get: { summary: List devices }
+  /api/v1/devices/{id}:
+    get: { summary: Get device }
+    delete: { summary: Retire device }
+  /api/v1/devices/me/heartbeat:
+    post: { summary: Device heartbeat }
+
+  /api/v1/policies:
+    get: { summary: List policies }
+    post: { summary: Create/update policy }
+  /api/v1/policies/{id}:
+    get: { summary: Get policy }
+  /api/v1/policies/{id}/diff:
+    get: { summary: Compute diff between two versions }
+  /api/v1/policies/assigned:
+    get: { summary: Device — fetch its assigned policy }
+
+  /api/v1/commands:
+    post: { summary: Issue a command to a device }
+  /api/v1/commands/{id}:
+    get: { summary: Get command }
+  /api/v1/commands/poll:
+    get: { summary: Device — claim pending commands (MQTT fallback) }
+  /api/v1/commands/{id}/ack:
+    post: { summary: Device — ACK command received }
+  /api/v1/commands/{id}/result:
+    post: { summary: Device — report final result }
+
+  /api/v1/telemetry/ingest:
+    post: { summary: Device — push batched telemetry events }
+  /api/v1/telemetry/devices/{deviceID}/latest:
+    get: { summary: Latest snapshot per kind }
+
+  /api/v1/files/upload:
+    post: { summary: Upload a file (multipart) }
+  /api/v1/files/{id}/url:
+    get: { summary: Presigned download URL }
+
+  /api/v1/audit:
+    get: { summary: List audit entries }
+    post: { summary: Append audit entry }

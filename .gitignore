@@ -44,6 +44,9 @@ server/**/data/
 # Env / secrets
 .env
 .env.*
+# But always ship .env.example — it's a template, not a secret.
+!.env.example
+!**/.env.example
 *.pem
 *.key
 *.crt

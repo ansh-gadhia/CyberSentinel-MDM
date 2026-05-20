@@ -76,3 +76,22 @@ func (h *Handler) Latest(c *fiber.Ctx) error {
 	}
 	return c.JSON(m)
 }
+
+// Events returns the reverse-chronological event stream for a device.
+//   GET /api/v1/telemetry/devices/:deviceID/events?limit=200&kind_prefix=activity.
+// Used by the admin UI's Activity tab.
+func (h *Handler) Events(c *fiber.Ctx) error {
+	tenantStr, _ := c.Locals(middleware.CtxTenantID).(string)
+	tenantID, _ := uuid.Parse(tenantStr)
+	devID, err := uuid.Parse(c.Params("deviceID"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid device id"})
+	}
+	limit := c.QueryInt("limit", 200)
+	prefix := c.Query("kind_prefix")
+	items, err := h.repo.List(c.Context(), tenantID, devID, limit, prefix)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"items": items})
+}

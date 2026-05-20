@@ -27,6 +27,7 @@ import (
 	"github.com/mdm/device-service/internal/repository"
 	"github.com/mdm/shared/auth"
 	apperr "github.com/mdm/shared/errors"
+	"github.com/mdm/shared/events"
 	"github.com/mdm/shared/models"
 	"github.com/mdm/shared/mq"
 )
@@ -186,6 +187,21 @@ func (s *EnrollmentService) Enroll(ctx context.Context, in dto.EnrollRequest) (*
 		})
 		_, _ = s.bus.JS.Publish("mdm.device.enrolled", evt, nats.AckWait(2*time.Second))
 	}
+	auditMeta, _ := json.Marshal(map[string]any{
+		"serial_number": dev.SerialNumber,
+		"manufacturer":  dev.Manufacturer,
+		"model":         dev.Model,
+		"os_version":    dev.OSVersion,
+	})
+	events.Emit(ctx, s.bus, events.AuditEnvelope{
+		TenantID:   dev.TenantID.String(),
+		ActorKind:  "device",
+		ActorID:    events.UUIDStrPtr(dev.ID),
+		Action:     "device.enrolled",
+		TargetKind: events.StrPtr("device"),
+		TargetID:   events.UUIDStrPtr(dev.ID),
+		Metadata:   auditMeta,
+	})
 
 	return &dto.EnrollResponse{
 		DeviceID:     dev.ID.String(),

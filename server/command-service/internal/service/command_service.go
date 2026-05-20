@@ -11,12 +11,19 @@ import (
 	"github.com/mdm/command-service/internal/repository"
 	"github.com/mdm/command-service/internal/types"
 	apperr "github.com/mdm/shared/errors"
+	"github.com/mdm/shared/events"
 	"github.com/mdm/shared/models"
+	"github.com/mdm/shared/mq"
 )
 
-type CommandService struct{ repo *repository.CommandRepo }
+type CommandService struct {
+	repo *repository.CommandRepo
+	bus  *mq.Bus
+}
 
-func NewCommandService(r *repository.CommandRepo) *CommandService { return &CommandService{repo: r} }
+func NewCommandService(r *repository.CommandRepo, bus *mq.Bus) *CommandService {
+	return &CommandService{repo: r, bus: bus}
+}
 
 type CreateInput struct {
 	TenantID    uuid.UUID
@@ -54,6 +61,16 @@ func (s *CommandService) Create(ctx context.Context, in CreateInput) (*models.Co
 	if err := s.repo.Insert(ctx, cmd); err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, "insert command", err)
 	}
+	meta, _ := json.Marshal(map[string]any{"kind": cmd.Kind, "device_id": cmd.DeviceID.String()})
+	events.Emit(ctx, s.bus, events.AuditEnvelope{
+		TenantID:   cmd.TenantID.String(),
+		ActorID:    events.UUIDStrPtr(cmd.CreatedBy),
+		ActorKind:  "user",
+		Action:     "command.created." + cmd.Kind,
+		TargetKind: events.StrPtr("device"),
+		TargetID:   events.UUIDStrPtr(cmd.DeviceID),
+		Metadata:   meta,
+	})
 	return cmd, nil
 }
 
@@ -97,6 +114,28 @@ type ResultInput struct {
 func (s *CommandService) Result(ctx context.Context, id uuid.UUID, in ResultInput) error {
 	if err := s.repo.Complete(ctx, id, in.Success, in.Result, in.Error); err != nil {
 		return apperr.Wrap(apperr.CodeInternal, "complete", err)
+	}
+	// Best-effort audit emit. We re-read the command so the audit entry carries
+	// tenant + device context even though the device-side callback only has id.
+	if cmd, err := s.repo.GetByID(ctx, id); err == nil && cmd != nil {
+		action := "command.succeeded." + cmd.Kind
+		if !in.Success {
+			action = "command.failed." + cmd.Kind
+		}
+		meta, _ := json.Marshal(map[string]any{
+			"kind":     cmd.Kind,
+			"error":    in.Error,
+			"attempts": cmd.Attempts,
+		})
+		events.Emit(ctx, s.bus, events.AuditEnvelope{
+			TenantID:   cmd.TenantID.String(),
+			ActorKind:  "device",
+			ActorID:    events.UUIDStrPtr(cmd.DeviceID),
+			Action:     action,
+			TargetKind: events.StrPtr("device"),
+			TargetID:   events.UUIDStrPtr(cmd.DeviceID),
+			Metadata:   meta,
+		})
 	}
 	return nil
 }

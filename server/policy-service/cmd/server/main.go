@@ -20,6 +20,7 @@ import (
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
 	"github.com/mdm/shared/middleware"
+	"github.com/mdm/shared/mq"
 )
 
 func main() {
@@ -40,7 +41,11 @@ func main() {
 
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.JWTAccessTTL)
 	repo := repository.NewPolicyRepo(pg)
-	svc := service.NewPolicyService(repo)
+	bus, err := mq.Connect(cfg.NATSUrl)
+	if err != nil {
+		log.Warn().Err(err).Msg("nats connect — audit events will be dropped")
+	}
+	svc := service.NewPolicyService(repo, bus)
 	h := handlers.NewPolicyHandler(svc)
 
 	app := fiber.New(fiber.Config{
@@ -51,17 +56,28 @@ func main() {
 
 	app.Get("/healthz", func(c *fiber.Ctx) error { return c.SendString("ok") })
 
+	// IMPORTANT: register the device-facing /assigned route BEFORE the
+	// admin group's "/:id" catch-all is registered. Fiber matches routes
+	// in declaration order, and "/:id" happily consumes the literal
+	// segment "assigned" — sending the request into h.Get, which then
+	// returns 400 on the failed uuid.Parse. That bug made every device-
+	// side policy fetch fail silently for months: APPLY_POLICY commands
+	// completed with empty result {} because the agent never got the spec.
+	app.Get("/api/v1/policies/assigned",
+		middleware.JWTAuth(issuer), middleware.RequireDevice(), middleware.TenantScope(), h.AssignedForDevice)
+
 	admin := app.Group("/api/v1/policies", middleware.JWTAuth(issuer), middleware.TenantScope())
 	admin.Get("/", h.List)
 	admin.Post("/", middleware.RequireRole("super_admin", "admin"), h.Upsert)
+	admin.Get("/resolved-for/:deviceID", h.ResolvedForDevice)
+	admin.Get("/for-device/:deviceID", h.AssignmentsForDevice)
 	admin.Get("/:id", h.Get)
 	admin.Get("/:id/diff", h.Diff)
+	admin.Get("/:id/assignments", h.ListAssignments)
 	admin.Post("/:id/versions", middleware.RequireRole("super_admin", "admin"), h.Upsert)
+	admin.Delete("/:id", middleware.RequireRole("super_admin", "admin"), h.Delete)
 	admin.Post("/assign", middleware.RequireRole("super_admin", "admin"), h.Assign)
-
-	// Device-facing assigned-policy retrieval.
-	app.Get("/api/v1/policies/assigned",
-		middleware.JWTAuth(issuer), middleware.RequireDevice(), middleware.TenantScope(), h.AssignedForDevice)
+	admin.Post("/unassign", middleware.RequireRole("super_admin", "admin"), h.Unassign)
 
 	go func() {
 		mux := http.NewServeMux()

@@ -10,10 +10,17 @@ x-go-env: &go-env
   MQTT_USER: ${MQTT_USER:-mdm}
   MQTT_PASS: ${MQTT_PASS:-mdmpass}
   MINIO_ENDPOINT: minio:9000
+  # Public host the browser will use to fetch presigned URLs. Defaults to
+  # localhost:9000 (works when the admin uses the same machine the stack runs
+  # on); override via .env when serving the UI to remote browsers.
+  MINIO_PUBLIC_ENDPOINT: ${MINIO_PUBLIC_ENDPOINT:-localhost:9000}
   MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY:-minioadmin}
   MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-minioadmin}
   JWT_SECRET: ${JWT_SECRET:-please-change-this-in-prod-32-bytes-min}
-  JWT_ACCESS_TTL: "15m"
+  # Matches the Android agent's DEFAULT_ACCESS_LIFE_S so a re-enrolled device
+  # doesn't silently lock itself out before its proactive refresh window kicks
+  # in. Adjust here AND in EnrollmentManager.DEFAULT_ACCESS_LIFE_S together.
+  JWT_ACCESS_TTL: "60m"
   JWT_REFRESH_TTL: "168h"
   LOG_LEVEL: ${LOG_LEVEL:-info}
   ENV: ${ENV:-development}

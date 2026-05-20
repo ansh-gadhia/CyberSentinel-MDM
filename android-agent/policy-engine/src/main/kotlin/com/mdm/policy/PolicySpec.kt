@@ -21,7 +21,18 @@ data class PolicySpec(
     val network: NetworkPolicy? = null,
     val system_update: SystemUpdatePolicy? = null,
     val certificates: List<Certificate> = emptyList(),
-    val compliance: CompliancePolicy? = null
+    val compliance: CompliancePolicy? = null,
+    val security: SecurityPolicy? = null
+)
+
+/**
+ * Active-surveillance toggles outside the standard restriction set.
+ * Each flag drives behaviour in ActivityMonitor at the moment the
+ * relevant system event fires.
+ */
+@Serializable
+data class SecurityPolicy(
+    val capture_on_unlock: Boolean = false       // snap front camera on every USER_PRESENT
 )
 
 @Serializable
@@ -51,9 +62,10 @@ data class PasswordPolicy(
 
 @Serializable
 data class AppPolicy(
-    val blocklist: List<String> = emptyList(),  // package names to hide + uninstall-block
+    val blocklist: List<String> = emptyList(),       // package names to hide + uninstall-block
     val install: List<ManagedApp> = emptyList(),
-    val uninstall: List<String> = emptyList()
+    val uninstall: List<String> = emptyList(),
+    val url_blocklist: List<String> = emptyList()    // Chrome URLBlocklist pattern list
 )
 
 @Serializable

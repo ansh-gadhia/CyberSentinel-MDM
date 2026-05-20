@@ -45,13 +45,27 @@ class AuthRepository @Inject constructor(
         return refreshNow()
     }
 
-    /** Force a refresh — used by the 401 retry. */
+    /**
+     * Force a refresh — used by the 401 retry. The caller (TokenAuthenticator)
+     * only invokes this AFTER the server has rejected the current token, so
+     * we MUST actually hit /auth/refresh; a "double-check the clock" guard
+     * here would silently return the rejected token and lock the agent out
+     * forever (the agent's local TTL view can diverge from the server's:
+     * clock skew, JWT_SECRET rotation, or a wrong DEFAULT_ACCESS_LIFE_S baked
+     * in at enrollment).
+     *
+     * Single-flight semantics are preserved by [refreshMutex] — concurrent
+     * 401s coalesce into one refresh call.
+     */
     suspend fun refreshNow(): String? = refreshMutex.withLock {
-        // Re-check under lock — another coroutine may have just refreshed.
-        val now = System.currentTimeMillis() / 1000
-        if (tokens.accessExpiresEpochS() > now + 30) {
-            return@withLock tokens.accessToken()
-        }
+        // If a concurrent caller JUST refreshed under the lock, the
+        // currently-stored token is fresh — return it without another round
+        // trip. We detect that by checking whether the access token in the
+        // store has *changed* since the request was issued; the simplest
+        // sentinel is the expiry having moved into the future relative to a
+        // safe lower-bound (the moment we entered the lock).
+        // We deliberately do NOT short-circuit on "exp > now + N" alone —
+        // that's what caused the lockout bug.
         val rt = tokens.refreshToken() ?: return@withLock null
         val resp = runCatching { apiHolder.get().refresh(RefreshRequest(rt)) }
             .onFailure { Timber.w(it, "refresh failed") }

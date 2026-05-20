@@ -6,11 +6,18 @@ export default {
     extend: {
       colors: {
         brand: {
-          50:  '#eef6ff',
+          50:  '#eff6ff',
+          100: '#dbeafe',
+          300: '#93c5fd',
           500: '#3b82f6',
           600: '#2563eb',
-          700: '#1d4ed8'
+          700: '#1d4ed8',
+          800: '#1e40af',
+          950: '#172554'
         }
+      },
+      boxShadow: {
+        glow: '0 0 0 4px rgba(37, 99, 235, 0.12)'
       }
     }
   },

@@ -12,6 +12,7 @@ import (
 	"github.com/mdm/device-service/internal/dto"
 	"github.com/mdm/device-service/internal/repository"
 	apperr "github.com/mdm/shared/errors"
+	"github.com/mdm/shared/events"
 	"github.com/mdm/shared/models"
 	"github.com/mdm/shared/mq"
 )
@@ -41,7 +42,20 @@ func (s *DeviceService) Get(ctx context.Context, tenantID, id uuid.UUID) (*model
 }
 
 func (s *DeviceService) Heartbeat(ctx context.Context, deviceID uuid.UUID, hb dto.HeartbeatRequest) error {
-	if err := s.devices.Heartbeat(ctx, deviceID, hb.AppliedPolicyVer); err != nil {
+	if err := s.devices.Heartbeat(ctx, deviceID, repository.HeartbeatRich{
+		AppliedVer:       hb.AppliedPolicyVer,
+		Latitude:         hb.Latitude,
+		Longitude:        hb.Longitude,
+		AccuracyM:        hb.LocationAccuracyM,
+		IPAddress:        hb.IPAddress,
+		MACAddress:       hb.MACAddress,
+		BatteryPct:       hb.Battery,
+		Charging:         hb.Charging,
+		VpnActive:        hb.VpnActive,
+		StorageFreeBytes: hb.StorageFreeBytes,
+		WifiSsid:         hb.WifiSsid,
+		NetworkType:      hb.NetworkType,
+	}); err != nil {
 		return apperr.Wrap(apperr.CodeInternal, "heartbeat", err)
 	}
 	if s.bus != nil {
@@ -72,5 +86,12 @@ func (s *DeviceService) Retire(ctx context.Context, tenantID, id uuid.UUID) erro
 		evt, _ := json.Marshal(map[string]any{"device_id": id, "tenant_id": tenantID, "at": time.Now()})
 		_, _ = s.bus.JS.Publish("mdm.device.retired", evt)
 	}
+	events.Emit(ctx, s.bus, events.AuditEnvelope{
+		TenantID:   tenantID.String(),
+		ActorKind:  "user",
+		Action:     "device.retired",
+		TargetKind: events.StrPtr("device"),
+		TargetID:   events.UUIDStrPtr(id),
+	})
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
+	"github.com/rs/zerolog/log"
 
 	"github.com/mdm/file-service/internal/repository"
 	"github.com/mdm/file-service/internal/storage"
@@ -23,29 +24,35 @@ type Handler struct {
 
 func New(r *repository.FileRepo, s *storage.Storage) *Handler { return &Handler{repo: r, store: s} }
 
-// Upload streams a multipart file into MinIO and records metadata.
+// Upload streams a multipart file into MinIO and records metadata. Admin path —
+// the uploader is the authenticated user.
 func (h *Handler) Upload(c *fiber.Ctx) error {
+	return h.upload(c, false)
+}
+
+// DeviceUpload is the device-authenticated counterpart used for camera
+// captures and log bundles. Files are tied to the calling device's id.
+func (h *Handler) DeviceUpload(c *fiber.Ctx) error {
+	return h.upload(c, true)
+}
+
+func (h *Handler) upload(c *fiber.Ctx, byDevice bool) error {
 	mf, err := c.FormFile("file")
 	if err != nil {
-		return c.Status(400).JSON(fiber.Map{"error": "file form field required"})
+		log.Warn().Err(err).Msg("upload: FormFile parse failed")
+		return c.Status(400).JSON(fiber.Map{"error": "file form field required: " + err.Error()})
 	}
 	kind := c.FormValue("kind", "generic")
 	name := c.FormValue("name", mf.Filename)
 	tenantID := tenantOf(c)
-	userID := userOf(c)
 
 	f, err := mf.Open()
 	if err != nil {
+		log.Error().Err(err).Msg("upload: form open failed")
 		return c.Status(500).JSON(fiber.Map{"error": "open form: " + err.Error()})
 	}
 	defer f.Close()
 
-	// We must compute sha256 while streaming. To avoid buffering the whole APK
-	// in memory we tee through a hasher into a pipe, but MinIO's SDK needs a
-	// Reader with known size. Simplest correct approach: write to disk-backed
-	// tmp file or use TeeReader against an in-memory buffer. For real-world
-	// APK sizes (50–200MB) a TeeReader into a temp file is best — kept simple
-	// here with a single read pass.
 	h1 := sha256.New()
 	pr, pw := io.Pipe()
 	errCh := make(chan error, 1)
@@ -57,9 +64,11 @@ func (h *Handler) Upload(c *fiber.Ctx) error {
 
 	storageKey := fmt.Sprintf("%s/%s/%s", kind, tenantID, uuid.NewString())
 	if err := h.store.Put(c.Context(), storageKey, pr, mf.Size, mf.Header.Get("Content-Type")); err != nil {
+		log.Error().Err(err).Str("key", storageKey).Int64("size", mf.Size).Msg("upload: MinIO Put failed")
 		return c.Status(500).JSON(fiber.Map{"error": "store: " + err.Error()})
 	}
 	if err := <-errCh; err != nil {
+		log.Error().Err(err).Msg("upload: hash copy failed")
 		return c.Status(500).JSON(fiber.Map{"error": "hash: " + err.Error()})
 	}
 
@@ -71,16 +80,35 @@ func (h *Handler) Upload(c *fiber.Ctx) error {
 		SHA256:      hex.EncodeToString(h1.Sum(nil)),
 		SizeBytes:   mf.Size,
 		ContentType: mf.Header.Get("Content-Type"),
-		UploadedBy:  userID,
+	}
+	if byDevice {
+		did := deviceOf(c)
+		obj.UploadedByDevice = &did
+		obj.DeviceID = &did
+	} else {
+		uid := userOf(c)
+		obj.UploadedBy = &uid
+		if dStr := c.FormValue("device_id"); dStr != "" {
+			if d, err := uuid.Parse(dStr); err == nil {
+				obj.DeviceID = &d
+			}
+		}
 	}
 	if err := h.repo.Insert(c.Context(), obj); err != nil {
+		log.Error().Err(err).Str("kind", kind).Str("name", name).Msg("upload: DB persist failed")
 		return c.Status(500).JSON(fiber.Map{"error": "persist: " + err.Error()})
 	}
 	return c.Status(201).JSON(obj)
 }
 
 func (h *Handler) List(c *fiber.Ctx) error {
-	out, err := h.repo.List(c.Context(), tenantOf(c), c.Query("kind"))
+	filt := repository.ListFilter{TenantID: tenantOf(c), Kind: c.Query("kind")}
+	if s := c.Query("device_id"); s != "" {
+		if d, err := uuid.Parse(s); err == nil {
+			filt.DeviceID = &d
+		}
+	}
+	out, err := h.repo.List(c.Context(), filt)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -88,6 +116,15 @@ func (h *Handler) List(c *fiber.Ctx) error {
 }
 
 // Presign returns a short-lived download URL for a stored object.
+//
+// Host selection: the URL is signed against whatever host the admin browser
+// is currently reaching the server at (X-Forwarded-Host from our admin nginx,
+// falling back to the Host header on the inbound request). This means a
+// laptop on the office LAN, a phone tethered to cellular, and a remote VPN
+// client all get a URL that resolves on THEIR network without any static
+// MINIO_PUBLIC_ENDPOINT reconfiguration. The companion nginx location at
+// `/mdm-files/` proxies the actual byte-range request to the internal
+// minio:9000 endpoint while preserving Host so the SigV4 check passes.
 func (h *Handler) Presign(c *fiber.Ctx) error {
 	id, err := uuid.Parse(c.Params("id"))
 	if err != nil {
@@ -97,11 +134,41 @@ func (h *Handler) Presign(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(404).JSON(fiber.Map{"error": "not found"})
 	}
-	url, err := h.store.PresignDownload(c.Context(), obj.StorageKey, 10*time.Minute)
+	pubEndpoint := publicEndpointFromRequest(c)
+	url, err := h.store.PresignDownloadFor(c.Context(), obj.StorageKey, 10*time.Minute, pubEndpoint)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(fiber.Map{"url": url, "expires_in": 600, "sha256": obj.SHA256, "size": obj.SizeBytes})
+}
+
+// publicEndpointFromRequest returns "scheme://host[:port]" the admin's
+// browser used to hit the API, or "" if nothing useful is on the request.
+// nginx's proxy.inc sets both X-Forwarded-Host and X-Forwarded-Proto.
+func publicEndpointFromRequest(c *fiber.Ctx) string {
+	host := c.Get("X-Forwarded-Host")
+	if host == "" {
+		host = c.Hostname()
+	}
+	if host == "" {
+		return ""
+	}
+	proto := c.Get("X-Forwarded-Proto")
+	if proto == "" {
+		proto = "http"
+	}
+	return proto + "://" + host
+}
+
+func (h *Handler) Delete(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
+	}
+	if err := h.repo.SoftDelete(c.Context(), tenantOf(c), id); err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.SendStatus(204)
 }
 
 func tenantOf(c *fiber.Ctx) uuid.UUID {
@@ -111,6 +178,11 @@ func tenantOf(c *fiber.Ctx) uuid.UUID {
 }
 func userOf(c *fiber.Ctx) uuid.UUID {
 	s, _ := c.Locals(middleware.CtxUserID).(string)
+	t, _ := uuid.Parse(s)
+	return t
+}
+func deviceOf(c *fiber.Ctx) uuid.UUID {
+	s, _ := c.Locals(middleware.CtxDeviceID).(string)
 	t, _ := uuid.Parse(s)
 	return t
 }

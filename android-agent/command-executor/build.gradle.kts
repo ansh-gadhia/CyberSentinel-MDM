@@ -22,6 +22,8 @@ dependencies {
     implementation(project(":networking"))
     implementation(project(":policy-engine"))
     implementation(project(":telemetry"))
+    implementation(project(":camera"))
+    implementation(project(":security"))
     implementation(Deps.coroutines)
     implementation(Deps.serializationJson)
     implementation(Deps.coreKtx)

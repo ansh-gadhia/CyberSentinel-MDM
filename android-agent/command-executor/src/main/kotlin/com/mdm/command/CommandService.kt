@@ -9,11 +9,15 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import com.mdm.camera.LocationFix
+import com.mdm.core.admin.DevicePolicyController
+import com.mdm.networking.api.HeartbeatDto
 import com.mdm.networking.api.MdmApi
 import com.mdm.networking.auth.AuthRepository
 import com.mdm.networking.auth.TokenStore
 import com.mdm.networking.mqtt.MdmMqttClient
 import com.mdm.policy.PolicySyncWorker
+import com.mdm.telemetry.TelemetryCollector
 import com.mdm.telemetry.TelemetryWorker
 import com.squareup.moshi.JsonAdapter
 import com.squareup.moshi.Moshi
@@ -25,7 +29,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import javax.inject.Inject
@@ -56,10 +60,15 @@ class CommandService : Service() {
     @Inject lateinit var executor: CommandExecutor
     @Inject lateinit var api: MdmApi
     @Inject lateinit var moshi: Moshi
+    @Inject lateinit var collector: TelemetryCollector
+    @Inject lateinit var locator: LocationFix
+    @Inject lateinit var dpm: DevicePolicyController
+    @Inject lateinit var activityMonitor: ActivityMonitor
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var mqttJob: Job? = null
     private var pollJob: Job? = null
+    private var heartbeatJob: Job? = null
     private lateinit var commandAdapter: JsonAdapter<com.mdm.networking.api.CommandDto>
 
     override fun onCreate() {
@@ -67,6 +76,16 @@ class CommandService : Service() {
         @OptIn(ExperimentalStdlibApi::class)
         commandAdapter = moshi.adapter<com.mdm.networking.api.CommandDto>()
         startForegroundSafely()
+        // Idempotent — pre-grant runtime permissions + flip AUTO_GRANT on
+        // every service start. Fixes the case where the device was already
+        // provisioned (so onProfileProvisioningComplete won't fire again)
+        // but the agent build is new and hadn't run the grant yet.
+        runCatching { dpm.applyDeviceOwnerPermissionDefaults() }
+            .onFailure { Timber.w(it, "permission defaults failed at service start") }
+        // Arm the Doze-resistant alarm chain on every service create so any
+        // future OS kill is recovered within ~3 minutes (the alarm cadence)
+        // rather than waiting for WorkManager's 15-min floor.
+        KeepAliveAlarm.schedule(applicationContext)
         Timber.i("CommandService started")
     }
 
@@ -78,6 +97,7 @@ class CommandService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onDestroy() {
+        activityMonitor.stop()
         scope.cancel()
         mqtt.disconnect()
         super.onDestroy()
@@ -85,13 +105,71 @@ class CommandService : Service() {
 
     private fun ensureWired() {
         if (mqttJob != null) return
+        // KeepAlive runs even before enrollment so a never-enrolled device
+        // still gets the service respawned (otherwise an OS kill in the
+        // pre-enrollment window would mean the user has to manually open
+        // the app to get the agent back).
+        KeepAliveWorker.schedule(applicationContext)
         mqttJob = scope.launch {
             while (!auth.isEnrolled()) delay(10_000)
             wireMqtt()
             startPollLoop()
+            startFastHeartbeat()
+            activityMonitor.start(scope)
             // Schedule periodic background work now that we have credentials.
             PolicySyncWorker.schedule(applicationContext)
             TelemetryWorker.schedule(applicationContext)
+        }
+    }
+
+    /**
+     * Fast heartbeat loop. Posts /devices/me/heartbeat every [HEARTBEAT_MS]
+     * (60s) so the admin "Connected" indicator stays green and so the
+     * device's IP/MAC + last-known location stay fresh on the server.
+     *
+     * - IP / MAC: read on every tick (cheap).
+     * - Location: refreshed every [LOCATION_REFRESH_MS] (5 min) to avoid
+     *   waking GPS each minute. We piggy-back the cached fix on subsequent
+     *   heartbeats so the admin UI sees a moving dot every minute even
+     *   though the underlying provider only fires every 5 minutes.
+     *
+     * The body is wrapped in a try/catch around the WHOLE iteration so a
+     * single bad response (auth blip, network hiccup) can't kill the loop.
+     */
+    private fun startFastHeartbeat() {
+        if (heartbeatJob != null) return
+        heartbeatJob = scope.launch {
+            var lastLocAt = 0L
+            var cachedLoc: LocationFix.Snapshot? = null
+            while (true) {
+                try {
+                    if (auth.isEnrolled()) {
+                        val s = collector.snapshot()
+                        val now = System.currentTimeMillis()
+                        if (cachedLoc == null || now - lastLocAt > LOCATION_REFRESH_MS) {
+                            val fresh = runCatching { locator.get(timeoutMs = 5_000L) }.getOrNull()
+                            if (fresh != null) { cachedLoc = fresh; lastLocAt = now }
+                        }
+                        api.postHeartbeat(HeartbeatDto(
+                            battery = s.batteryPct.takeIf { it >= 0 },
+                            charging = s.charging,
+                            network = s.network,
+                            vpnActive = s.vpnActive,
+                            appliedPolicyVersion = null,
+                            latitude  = cachedLoc?.latitude,
+                            longitude = cachedLoc?.longitude,
+                            locationAccuracyM = cachedLoc?.accuracyM,
+                            ipAddress = s.ipAddress,
+                            macAddress = s.macAddress,
+                            storageFreeBytes = s.storageFreeBytes.takeIf { it >= 0 },
+                            wifiSsid = s.ssid
+                        ))
+                    }
+                } catch (t: Throwable) {
+                    Timber.v(t, "fast heartbeat iteration failed (non-fatal)")
+                }
+                delay(HEARTBEAT_MS)
+            }
         }
     }
 
@@ -115,7 +193,15 @@ class CommandService : Service() {
             subscribeTopic = topic
         )
         scope.launch {
-            mqtt.messages().collectLatest { msg ->
+            // IMPORTANT: collect, NOT collectLatest. Each command must run to
+            // completion — including the POST /commands/{id}/result inside
+            // executor.execute(). With collectLatest a second command arriving
+            // mid-flight would cancel the first command's result-POST, making
+            // it look on the server like the command was never acked
+            // (state stuck on "dispatched" until it timed out) even though the
+            // device-side side-effect (camera capture, install, policy apply)
+            // had actually run.
+            mqtt.messages().collect { msg ->
                 runCatching {
                     val cmd = commandAdapter.fromJson(String(msg.bytes, Charsets.UTF_8))
                         ?: return@runCatching
@@ -160,7 +246,16 @@ class CommandService : Service() {
             .setPriority(androidx.core.app.NotificationCompat.PRIORITY_MIN)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            // Android 14+ requires the active FG service types to be declared
+            // when calling startForeground. We OR every type we will actually
+            // use: DATA_SYNC (always), CAMERA (for CAPTURE_PHOTO) and LOCATION
+            // (for GET_LOCATION / live tracking).
+            startForeground(
+                NOTIF_ID, notif,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            )
         } else {
             startForeground(NOTIF_ID, notif)
         }
@@ -171,6 +266,8 @@ class CommandService : Service() {
         private const val NOTIF_ID = 0xCAFE
         private const val POLL_HEALTHY_MS = 5 * 60_000L
         private const val POLL_DEGRADED_MS = 30_000L
+        private const val HEARTBEAT_MS = 60_000L
+        private const val LOCATION_REFRESH_MS = 5 * 60_000L
 
         fun start(ctx: Context) {
             val intent = Intent(ctx, CommandService::class.java)

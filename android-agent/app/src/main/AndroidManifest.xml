@@ -16,10 +16,20 @@
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"
+                     tools:ignore="ManifestTypo" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
     <uses-permission android:name="android.permission.READ_PHONE_STATE" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- Special access: enables foreground-app tracking (SIEM-style activity log).
+         Granted manually in Settings → Apps → Special access → Usage data access.
+         The agent's ActivityMonitor surfaces an `activity.permission.needed` event
+         when this is missing so the admin UI can prompt for it. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS"
+                     tools:ignore="ProtectedPermissions" />
 
     <application
         android:name=".MDMApplication"
@@ -60,11 +70,43 @@
             </intent-filter>
         </receiver>
 
-        <!-- Foreground service that keeps the MQTT command channel alive -->
+        <!--
+            Foreground service that keeps the MQTT command channel alive.
+            Declares camera + location types so the service can host the
+            CAPTURE_PHOTO / GET_LOCATION commands while running.
+        -->
         <service
             android:name="com.mdm.command.CommandService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="dataSync|camera|location" />
+
+        <!--
+            Receives PackageInstaller session commit callbacks. In DA mode the
+            session returns STATUS_PENDING_USER_ACTION which carries an Intent
+            the receiver launches so the system "Install this app?" dialog
+            appears on the phone.
+        -->
+        <receiver
+            android:name="com.mdm.command.InstallResultReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.mdm.PACKAGE_INSTALL_RESULT" />
+            </intent-filter>
+        </receiver>
+
+        <!--
+            Doze-resistant keep-alive. setAndAllowWhileIdle on this receiver
+            (every ~3 min) re-spawns CommandService even when the OS has
+            killed it for memory pressure, App Standby, or battery
+            optimization. Self-rescheduling — each tick arms the next.
+        -->
+        <receiver
+            android:name="com.mdm.command.KeepAliveAlarm$Receiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.mdm.KEEPALIVE_PING" />
+            </intent-filter>
+        </receiver>
 
         <!-- WorkManager init handled by Hilt -->
         <provider

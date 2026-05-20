@@ -33,6 +33,10 @@ class TelemetryCollector @Inject constructor(
         val batteryPct: Int,
         val charging: Boolean,
         val network: String,                // wifi | cellular | ethernet | none
+        val vpnActive: Boolean,             // true if any active network has TRANSPORT_VPN
+        val ipAddress: String?,             // primary non-loopback v4, e.g. 192.168.1.42
+        val macAddress: String?,            // hardware address of the active interface
+        val ssid: String?,                  // Wi-Fi SSID if connected over wifi
         val storageFreeBytes: Long,
         val storageTotalBytes: Long,
         val rooted: Boolean,
@@ -47,10 +51,15 @@ class TelemetryCollector @Inject constructor(
     fun snapshot(): Snapshot {
         val battery = readBattery()
         val ig = integrity.snapshot()
+        val netInfo = readNetInfo()
         return Snapshot(
             batteryPct = battery.first,
             charging = battery.second,
             network = readNetworkType(),
+            vpnActive = readVpnActive(),
+            ipAddress = netInfo.ipv4,
+            macAddress = netInfo.mac,
+            ssid = readSsid(),
             storageFreeBytes = readFreeBytes(),
             storageTotalBytes = readTotalBytes(),
             rooted = ig.rooted,
@@ -62,6 +71,57 @@ class TelemetryCollector @Inject constructor(
             occurredAtIso = java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC).toString()
         )
     }
+
+    /**
+     * True if ANY currently-connected network has TRANSPORT_VPN. We can't
+     * just check activeNetwork because a VPN run alongside Wi-Fi will often
+     * have a separate network handle; we walk all networks for accuracy.
+     */
+    private fun readVpnActive(): Boolean {
+        return try {
+            val cm = context.getSystemService(ConnectivityManager::class.java) ?: return false
+            val nets = cm.allNetworks
+            for (n in nets) {
+                val caps = cm.getNetworkCapabilities(n) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) return true
+            }
+            false
+        } catch (_: Throwable) { false }
+    }
+
+    private data class NetInfo(val ipv4: String?, val mac: String?)
+
+    /**
+     * Walks NetworkInterface to find the first non-loopback up interface with
+     * an IPv4 address; returns that address + the interface's hardware MAC.
+     *
+     * On Android 6+ the MAC reported here is the per-network randomised MAC,
+     * not the burned-in MAC — that's intentional Android privacy and
+     * matches what shows on the router's lease list.
+     */
+    private fun readNetInfo(): NetInfo {
+        return try {
+            val all = java.net.NetworkInterface.getNetworkInterfaces() ?: return NetInfo(null, null)
+            for (nif in all) {
+                if (!nif.isUp || nif.isLoopback || nif.isVirtual) continue
+                val ipv4 = nif.inetAddresses.toList().firstOrNull {
+                    it is java.net.Inet4Address && !it.isLoopbackAddress && !it.isLinkLocalAddress
+                }?.hostAddress
+                if (ipv4 != null) {
+                    val mac = nif.hardwareAddress?.joinToString(":") { "%02x".format(it) }
+                    return NetInfo(ipv4, mac)
+                }
+            }
+            NetInfo(null, null)
+        } catch (_: Throwable) { NetInfo(null, null) }
+    }
+
+    @Suppress("DEPRECATION")
+    private fun readSsid(): String? = try {
+        val wm = context.getSystemService(android.net.wifi.WifiManager::class.java) ?: return null
+        val info = wm.connectionInfo ?: return null
+        info.ssid?.removeSurrounding("\"")?.takeIf { it.isNotEmpty() && it != "<unknown ssid>" }
+    } catch (_: Throwable) { null }
 
     private fun readBattery(): Pair<Int, Boolean> {
         val filter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)

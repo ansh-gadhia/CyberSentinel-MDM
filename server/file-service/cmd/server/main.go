@@ -38,7 +38,7 @@ func main() {
 	}
 	defer pg.Close()
 
-	store, err := storage.New(cfg.MinioEndpoint, cfg.MinioAccessKey, cfg.MinioSecretKey, false)
+	store, err := storage.New(cfg.MinioEndpoint, cfg.MinioPublicEndpoint, cfg.MinioAccessKey, cfg.MinioSecretKey, false)
 	if err != nil {
 		log.Fatal().Err(err).Msg("minio")
 	}
@@ -60,7 +60,9 @@ func main() {
 	g := app.Group("/api/v1/files", middleware.JWTAuth(issuer), middleware.TenantScope())
 	g.Get("/", h.List)
 	g.Post("/upload", middleware.RequireRole("super_admin", "admin"), h.Upload)
+	g.Post("/device-upload", middleware.RequireDevice(), h.DeviceUpload)
 	g.Get("/:id/url", h.Presign)
+	g.Delete("/:id", middleware.RequireRole("super_admin", "admin"), h.Delete)
 
 	go func() {
 		mux := http.NewServeMux()

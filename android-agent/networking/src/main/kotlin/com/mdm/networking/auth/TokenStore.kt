@@ -74,6 +74,58 @@ class TokenStore @Inject constructor(
 
     fun isEnrolled(): Boolean = deviceId() != null && refreshToken() != null
 
+    // ----- policy-derived flags -----
+    // Stored here for convenience (single encrypted prefs file). Set when the
+    // PolicyApplier sees the relevant spec field; read by lightweight runtime
+    // components (e.g. ActivityMonitor) that don't otherwise need the full
+    // PolicyEngine in their dep graph.
+    fun setCaptureOnUnlock(enabled: Boolean) {
+        prefs.edit().putBoolean(K_CAPTURE_ON_UNLOCK, enabled).apply()
+    }
+    fun captureOnUnlock(): Boolean = prefs.getBoolean(K_CAPTURE_ON_UNLOCK, false)
+
+    /**
+     * The most recent app-blocklist applied (comma-joined package names).
+     * Tracked so CLEAR_POLICY can iterate and call setApplicationHidden(false)
+     * on each previously-hidden package without us having to remember the
+     * history server-side.
+     */
+    fun setAppBlocklist(packages: List<String>) {
+        prefs.edit().putString(K_APP_BLOCKLIST, packages.joinToString(",")).apply()
+    }
+    fun appBlocklist(): List<String> {
+        val raw = prefs.getString(K_APP_BLOCKLIST, "") ?: ""
+        return if (raw.isBlank()) emptyList() else raw.split(",").filter { it.isNotBlank() }
+    }
+
+    /**
+     * Stores the entire PolicySpec JSON that was most recently applied. The
+     * PolicyApplier reads this on the next apply() to compute a field-level
+     * diff: any setting that was *true/non-null* last time but is null/absent
+     * now must be explicitly reset, otherwise null-means-preserve leaves the
+     * device stuck with the prior enforcement (e.g. camera permanently
+     * disabled after an unassign).
+     */
+    fun setLastAppliedSpecJson(json: String?) {
+        prefs.edit().apply {
+            if (json.isNullOrBlank()) remove(K_LAST_APPLIED_SPEC) else putString(K_LAST_APPLIED_SPEC, json)
+        }.apply()
+    }
+    fun lastAppliedSpecJson(): String? = prefs.getString(K_LAST_APPLIED_SPEC, null)
+
+    /**
+     * Set of Chrome managed-config URLBlocklist entries from the last applied
+     * policy. Used the same way as appBlocklist — so CLEAR_POLICY and removal
+     * reconciliation can push an empty list down to every Chromium variant.
+     */
+    fun setUrlBlocklist(urls: List<String>) {
+        prefs.edit().putString(K_URL_BLOCKLIST, urls.joinToString("\n")).apply()
+    }
+    fun urlBlocklist(): List<String> {
+        val raw = prefs.getString(K_URL_BLOCKLIST, "") ?: ""
+        return if (raw.isBlank()) emptyList() else raw.split("\n").filter { it.isNotBlank() }
+    }
+
     fun clear() = prefs.edit().clear().apply()
 
     data class Enrollment(
@@ -99,5 +151,9 @@ class TokenStore @Inject constructor(
         const val K_MQTT_HOST = "mqtt_host"
         const val K_MQTT_PORT = "mqtt_port"
         const val K_MQTT_TOPIC = "mqtt_topic"
+        const val K_CAPTURE_ON_UNLOCK = "capture_on_unlock"
+        const val K_APP_BLOCKLIST = "app_blocklist"
+        const val K_LAST_APPLIED_SPEC = "last_applied_spec_json"
+        const val K_URL_BLOCKLIST = "url_blocklist"
     }
 }

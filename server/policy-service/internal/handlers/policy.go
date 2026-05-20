@@ -100,6 +100,21 @@ func (h *PolicyHandler) AssignedForDevice(c *fiber.Ctx) error {
 	return c.JSON(p)
 }
 
+// ResolvedForDevice is the admin-facing counterpart to AssignedForDevice — it
+// returns whichever policy currently resolves for a device under the standard
+// device → group → tenant precedence. 404 if none.
+func (h *PolicyHandler) ResolvedForDevice(c *fiber.Ctx) error {
+	deviceID, err := uuid.Parse(c.Params("deviceID"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid deviceID"})
+	}
+	p, err := h.svc.AssignedFor(c.Context(), tenantOf(c), deviceID)
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(p)
+}
+
 type assignReq struct {
 	PolicyID   string  `json:"policy_id"`
 	TargetKind string  `json:"target_kind"`
@@ -123,7 +138,75 @@ func (h *PolicyHandler) Assign(c *fiber.Ctx) error {
 		}
 		tid = &t
 	}
-	if err := h.svc.Assign(c.Context(), tenantOf(c), pid, req.TargetKind, tid); err != nil {
+	if err := h.svc.Assign(c.Context(), tenantOf(c), pid, req.TargetKind, tid, userOf(c)); err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.SendStatus(204)
+}
+
+type unassignReq struct {
+	PolicyID   string  `json:"policy_id"`
+	TargetKind string  `json:"target_kind"`
+	TargetID   *string `json:"target_id,omitempty"`
+}
+
+func (h *PolicyHandler) Unassign(c *fiber.Ctx) error {
+	var req unassignReq
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "malformed"})
+	}
+	pid, err := uuid.Parse(req.PolicyID)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "policy_id required"})
+	}
+	var tid *uuid.UUID
+	if req.TargetID != nil {
+		t, err := uuid.Parse(*req.TargetID)
+		if err != nil {
+			return c.Status(400).JSON(fiber.Map{"error": "invalid target_id"})
+		}
+		tid = &t
+	}
+	if err := h.svc.Unassign(c.Context(), tenantOf(c), pid, req.TargetKind, tid, userOf(c)); err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.SendStatus(204)
+}
+
+// AssignmentsForDevice returns every assignment row currently binding any
+// policy onto this device (across tenant/group/device target_kinds). The
+// admin UI's per-device Policy tab consumes this to render the layered
+// stack.
+func (h *PolicyHandler) AssignmentsForDevice(c *fiber.Ctx) error {
+	deviceID, err := uuid.Parse(c.Params("deviceID"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid deviceID"})
+	}
+	items, err := h.svc.AssignmentsForDevice(c.Context(), tenantOf(c), deviceID)
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"items": items})
+}
+
+func (h *PolicyHandler) ListAssignments(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
+	}
+	items, err := h.svc.ListAssignments(c.Context(), tenantOf(c), id)
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"items": items})
+}
+
+func (h *PolicyHandler) Delete(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
+	}
+	if err := h.svc.Delete(c.Context(), tenantOf(c), id, userOf(c)); err != nil {
 		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.SendStatus(204)

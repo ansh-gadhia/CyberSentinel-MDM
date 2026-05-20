@@ -97,11 +97,79 @@ class DevicePolicyController @Inject constructor(
         dpm.resetPassword(password, 0)
     }
 
+    // -------------------- reset-password token flow (DO, API 26+) ----------
+    //
+    // On Android O+ the only way for a Device Owner to change the lock-screen
+    // password remotely is the token-based flow:
+    //   1. setResetPasswordToken(admin, token) → caches the token.
+    //   2. (one-time) user confirms current credentials on device, which
+    //      activates the token.
+    //   3. resetPasswordWithToken(admin, newPassword, token, flags) → works
+    //      silently from then on.
+
+    /**
+     * Arms a reset-password token. Returns null on success, or a human-
+     * readable diagnostic string describing why the platform refused.
+     *
+     * Common refusal causes (the admin needs the hint to fix it):
+     *   - The device has no existing screen lock — the token API requires
+     *     one to be active so it can be activated by the user.
+     *   - File-Based Encryption is in direct-boot mode (rare).
+     *   - The platform image strips reset-password-token support (very rare).
+     */
+    fun armResetPasswordToken(token: ByteArray): String? {
+        return try {
+            if (token.size < 32) return "token is ${token.size} bytes, minimum is 32"
+            val ok = dpm.setResetPasswordToken(admin, token)
+            if (ok) null
+            else "setResetPasswordToken returned false. Most common cause: the device " +
+                 "has no existing PIN/pattern/password lock yet — Android's token API " +
+                 "requires an existing lock to activate the token. Set a lock on the " +
+                 "device first, then retry."
+        } catch (t: Throwable) {
+            Timber.w(t, "setResetPasswordToken threw")
+            "${t.javaClass.simpleName}: ${t.message ?: "no message"}"
+        }
+    }
+
+    fun isResetPasswordTokenActive(): Boolean {
+        return try { dpm.isResetPasswordTokenActive(admin) }
+        catch (t: Throwable) { false }
+    }
+
+    /**
+     * Clears any previously-set reset-password token. Safe to call even when
+     * no token is set. Used to recover from a stuck-token state on devices
+     * where setResetPasswordToken returns false when a stale token is present.
+     */
+    fun clearResetPasswordToken(): Boolean {
+        return try { dpm.clearResetPasswordToken(admin) }
+        catch (t: Throwable) { Timber.v(t, "clearResetPasswordToken no-op"); false }
+    }
+
+    fun resetPasswordWithToken(password: String, token: ByteArray): Boolean {
+        return try {
+            dpm.resetPasswordWithToken(admin, password, token,
+                android.app.admin.DevicePolicyManager.RESET_PASSWORD_REQUIRE_ENTRY)
+        } catch (t: Throwable) {
+            Timber.w(t, "resetPasswordWithToken failed"); false
+        }
+    }
+
     // -------------------- camera / capture ------------------
 
     fun setCameraDisabled(disabled: Boolean) = guarded("setCameraDisabled") {
         dpm.setCameraDisabled(admin, disabled)
     }
+
+    /**
+     * Reads the OS's current camera-disabled state. Used by capture paths
+     * to detect a self-imposed disable and temporarily lift it for a
+     * single shot, then restore.
+     */
+    fun isCameraDisabled(): Boolean = try {
+        dpm.getCameraDisabled(admin)
+    } catch (t: Throwable) { Timber.v(t, "getCameraDisabled failed"); false }
 
     fun setScreenCaptureDisabled(disabled: Boolean) = guarded("setScreenCaptureDisabled") {
         dpm.setScreenCaptureDisabled(admin, disabled)
@@ -136,6 +204,107 @@ class DevicePolicyController @Inject constructor(
         context.packageManager.getPackageInfo(packageName, 0); true
     } catch (e: PackageManager.NameNotFoundException) { false }
 
+    /**
+     * Pushes a URL pattern blocklist into Chrome's Managed Configuration
+     * bundle. Chrome (and Chromium-based browsers honoring the same schema:
+     * Edge, Brave, etc.) blocks any in-app navigation matching one of the
+     * patterns. Pattern syntax is the standard Chromium one — e.g.
+     * `youtube.com`, `*.youtube.com`, or scheme-and-path wildcards.
+     * Calling with an empty list clears the block by writing an empty array.
+     *
+     * Requires Device Owner / Profile Owner. Idempotent.
+     */
+    fun setChromeUrlBlocklist(patterns: List<String>) = guarded("setChromeUrlBlocklist") {
+        val targets = listOf(
+            "com.android.chrome",            // Chrome
+            "com.chrome.beta", "com.chrome.dev", "com.chrome.canary",
+            "com.microsoft.emmx",            // Edge (Chromium)
+            "com.brave.browser",             // Brave
+            "org.chromium.chrome"            // raw Chromium
+        )
+        val bundle = android.os.Bundle().apply {
+            putStringArray("URLBlocklist", patterns.toTypedArray())
+        }
+        for (pkg in targets) {
+            if (!isPackageInstalled(pkg)) continue
+            try {
+                dpm.setApplicationRestrictions(admin, pkg, bundle)
+                Timber.i("Pushed URLBlocklist (${patterns.size} patterns) to $pkg")
+            } catch (t: Throwable) {
+                Timber.w(t, "setApplicationRestrictions failed for $pkg")
+            }
+        }
+    }
+
+    /**
+     * Clears app data (cache + sharedPrefs + databases). Fires-and-forgets;
+     * the system callback fires once the wipe completes but we don't surface
+     * it here — the command result is "issued" rather than "completed".
+     */
+    fun clearApplicationUserData(packageName: String) = guarded("clearApplicationUserData") {
+        dpm.clearApplicationUserData(
+            admin, packageName,
+            java.util.concurrent.Executors.newSingleThreadExecutor()
+        ) { _, _ -> /* fire-and-forget */ }
+    }
+
+    /**
+     * Grants a runtime permission to a package without prompting the user.
+     * Only effective in Device Owner / Profile Owner mode on API 23+.
+     * No-op (returns false) in Device Admin mode.
+     */
+    fun grantRuntimePermission(packageName: String, permission: String): Boolean {
+        return try {
+            dpm.setPermissionGrantState(
+                admin, packageName, permission,
+                android.app.admin.DevicePolicyManager.PERMISSION_GRANT_STATE_GRANTED
+            )
+        } catch (t: Throwable) {
+            Timber.w(t, "grantRuntimePermission $permission denied (DO required)")
+            false
+        }
+    }
+
+    /**
+     * Idempotent: switches the platform-wide permission policy to
+     * AUTO_GRANT for our own package and pre-grants the runtime
+     * permissions the agent ever asks for. Must be called once after
+     * Device Owner is established (and is safe to re-call on every
+     * service start — DPM is happy with redundant calls).
+     *
+     * On non-DO devices [guarded] short-circuits and we silently
+     * downgrade to per-command lazy grants in the executor.
+     */
+    fun applyDeviceOwnerPermissionDefaults() {
+        if (!isAdminActive()) {
+            Timber.w("permission defaults skipped: admin not active")
+            return
+        }
+        runCatching {
+            // PERMISSION_POLICY_AUTO_GRANT: every future runtime permission
+            // request by *this* package is auto-granted without a dialog.
+            dpm.setPermissionPolicy(admin, DevicePolicyManager.PERMISSION_POLICY_AUTO_GRANT)
+        }.onFailure { Timber.w(it, "setPermissionPolicy AUTO_GRANT failed (DO required?)") }
+
+        // Belt-and-suspenders: also explicitly mark each known runtime
+        // permission as GRANTED. The AUTO_GRANT policy only fires on a
+        // requestPermissions() call; older Android versions don't always
+        // honor it for permissions never explicitly requested.
+        val pkg = context.packageName
+        val perms = listOf(
+            android.Manifest.permission.CAMERA,
+            android.Manifest.permission.ACCESS_FINE_LOCATION,
+            android.Manifest.permission.ACCESS_COARSE_LOCATION,
+            android.Manifest.permission.POST_NOTIFICATIONS,
+            android.Manifest.permission.READ_PHONE_STATE
+        )
+        var granted = 0
+        for (p in perms) {
+            if (grantRuntimePermission(pkg, p)) granted++
+        }
+        Timber.i("Pre-granted $granted/${perms.size} runtime permissions to $pkg")
+    }
+
     // -------------------- certs -----------------------------
 
     fun installCaCert(certPem: ByteArray): Boolean = guarded("installCaCert") {
@@ -149,17 +318,24 @@ class DevicePolicyController @Inject constructor(
     // -------------------- wifi / proxy ----------------------
 
     @RequiresApi(Build.VERSION_CODES.N)
-    fun setAlwaysOnVpn(packageName: String, lockdown: Boolean) = guarded("alwaysOnVpn") {
+    fun setAlwaysOnVpn(packageName: String?, lockdown: Boolean) = guarded("alwaysOnVpn") {
+        // packageName == null clears any always-on VPN binding.
         dpm.setAlwaysOnVpnPackage(admin, packageName, lockdown)
     }
 
-    fun setGlobalProxy(host: String, port: Int, exclusionList: List<String>) = guarded("globalProxy") {
+    fun setGlobalProxy(host: String?, port: Int, exclusionList: List<String>) = guarded("globalProxy") {
         // setRecommendedGlobalProxy is the modern replacement for the
         // deprecated setGlobalProxy(admin, java.net.Proxy, exclusions)
         // overload and is the only one that accepts a [ProxyInfo].
-        val proxy = android.net.ProxyInfo.buildDirectProxy(host, port, exclusionList)
-        dpm.setRecommendedGlobalProxy(admin, proxy)
-        Timber.i("Set global proxy $host:$port (excl=${exclusionList.joinToString(",")})")
+        // host == null clears the global proxy.
+        if (host.isNullOrBlank()) {
+            dpm.setRecommendedGlobalProxy(admin, null)
+            Timber.i("Cleared global proxy")
+        } else {
+            val proxy = android.net.ProxyInfo.buildDirectProxy(host, port, exclusionList)
+            dpm.setRecommendedGlobalProxy(admin, proxy)
+            Timber.i("Set global proxy $host:$port (excl=${exclusionList.joinToString(",")})")
+        }
     }
 
     // -------------------- system update ---------------------

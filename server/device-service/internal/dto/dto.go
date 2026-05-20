@@ -56,9 +56,18 @@ type QRPayload struct {
 // ---------- devices ----------
 
 type HeartbeatRequest struct {
-	Battery            *int    `json:"battery_pct,omitempty"`
-	NetworkType        *string `json:"network_type,omitempty"`
-	AppliedPolicyVer   *int    `json:"applied_policy_version,omitempty"`
+	Battery            *int     `json:"battery_pct,omitempty"`
+	Charging           *bool    `json:"charging,omitempty"`
+	NetworkType        *string  `json:"network_type,omitempty"`
+	VpnActive          *bool    `json:"vpn_active,omitempty"`
+	AppliedPolicyVer   *int     `json:"applied_policy_version,omitempty"`
+	Latitude           *float64 `json:"latitude,omitempty"`
+	Longitude          *float64 `json:"longitude,omitempty"`
+	LocationAccuracyM  *float32 `json:"location_accuracy_m,omitempty"`
+	IPAddress          *string  `json:"ip_address,omitempty"`
+	MACAddress         *string  `json:"mac_address,omitempty"`
+	StorageFreeBytes   *int64   `json:"storage_free_bytes,omitempty"`
+	WifiSsid           *string  `json:"wifi_ssid,omitempty"`
 }
 
 type UpdateDeviceInfoRequest struct {

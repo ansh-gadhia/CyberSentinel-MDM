@@ -75,4 +75,13 @@ interface MdmApi {
         @retrofit2.http.Url url: String,
         @Body body: RequestBody
     ): Response<Unit>
+
+    // ---------- device-authored uploads (camera, log bundles) ----------
+    @retrofit2.http.Multipart
+    @POST("api/v1/files/device-upload")
+    suspend fun deviceUpload(
+        @retrofit2.http.Part file: okhttp3.MultipartBody.Part,
+        @retrofit2.http.Part("kind") kind: RequestBody,
+        @retrofit2.http.Part("name") name: RequestBody
+    ): Response<DeviceUploadResponse>
 }

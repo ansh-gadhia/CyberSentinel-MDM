@@ -24,9 +24,10 @@ type Config struct {
 	MQTTUser   string
 	MQTTPass   string
 
-	MinioEndpoint  string
-	MinioAccessKey string
-	MinioSecretKey string
+	MinioEndpoint       string
+	MinioPublicEndpoint string // browser-reachable presign host (e.g. "localhost:9000")
+	MinioAccessKey      string
+	MinioSecretKey      string
 
 	JWTSecret     string
 	JWTAccessTTL  time.Duration
@@ -46,9 +47,10 @@ func Load() (Config, error) {
 		MQTTBroker:     getenv("MQTT_BROKER", "tcp://mosquitto:1883"),
 		MQTTUser:       getenv("MQTT_USER", "mdm"),
 		MQTTPass:       getenv("MQTT_PASS", "mdmpass"),
-		MinioEndpoint:  getenv("MINIO_ENDPOINT", "minio:9000"),
-		MinioAccessKey: getenv("MINIO_ACCESS_KEY", "minioadmin"),
-		MinioSecretKey: getenv("MINIO_SECRET_KEY", "minioadmin"),
+		MinioEndpoint:       getenv("MINIO_ENDPOINT", "minio:9000"),
+		MinioPublicEndpoint: getenv("MINIO_PUBLIC_ENDPOINT", "localhost:9000"),
+		MinioAccessKey:      getenv("MINIO_ACCESS_KEY", "minioadmin"),
+		MinioSecretKey:      getenv("MINIO_SECRET_KEY", "minioadmin"),
 		JWTSecret:      getenv("JWT_SECRET", ""),
 		PublicBaseURL:  getenv("PUBLIC_BASE_URL", "http://localhost"),
 	}

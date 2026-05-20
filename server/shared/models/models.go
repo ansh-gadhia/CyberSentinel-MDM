@@ -89,6 +89,18 @@ type Device struct {
 	LastHeartbeatAt     *time.Time      `db:"last_heartbeat_at" json:"last_heartbeat_at,omitempty"`
 	AssignedPolicyID    *uuid.UUID      `db:"assigned_policy_id" json:"assigned_policy_id,omitempty"`
 	AppliedPolicyVer    int             `db:"applied_policy_version" json:"applied_policy_version"`
+	LastLatitude        *float64        `db:"last_latitude" json:"last_latitude,omitempty"`
+	LastLongitude       *float64        `db:"last_longitude" json:"last_longitude,omitempty"`
+	LastLocationAccuracyM *float32      `db:"last_location_accuracy_m" json:"last_location_accuracy_m,omitempty"`
+	LastLocationAt      *time.Time      `db:"last_location_at" json:"last_location_at,omitempty"`
+	LastIPAddress       *string         `db:"last_ip_address" json:"last_ip_address,omitempty"`
+	LastMACAddress      *string         `db:"last_mac_address" json:"last_mac_address,omitempty"`
+	LastBatteryPct      *int            `db:"last_battery_pct" json:"last_battery_pct,omitempty"`
+	LastCharging        *bool           `db:"last_charging" json:"last_charging,omitempty"`
+	LastVpnActive       *bool           `db:"last_vpn_active" json:"last_vpn_active,omitempty"`
+	LastStorageFreeBytes *int64         `db:"last_storage_free_bytes" json:"last_storage_free_bytes,omitempty"`
+	LastWifiSsid        *string         `db:"last_wifi_ssid" json:"last_wifi_ssid,omitempty"`
+	LastNetworkType     *string         `db:"last_network_type" json:"last_network_type,omitempty"`
 	GroupID             *uuid.UUID      `db:"group_id" json:"group_id,omitempty"`
 	Tags                json.RawMessage `db:"tags" json:"tags,omitempty"`
 	Metadata            json.RawMessage `db:"metadata" json:"metadata,omitempty"`
@@ -125,6 +137,15 @@ type Policy struct {
 	CreatedAt  time.Time       `db:"created_at" json:"created_at"`
 	UpdatedAt  time.Time       `db:"updated_at" json:"updated_at"`
 	DeletedAt  *time.Time      `db:"deleted_at" json:"deleted_at,omitempty"`
+}
+
+type PolicyAssignment struct {
+	ID         uuid.UUID  `db:"id" json:"id"`
+	TenantID   uuid.UUID  `db:"tenant_id" json:"tenant_id"`
+	PolicyID   uuid.UUID  `db:"policy_id" json:"policy_id"`
+	TargetKind string     `db:"target_kind" json:"target_kind"`
+	TargetID   *uuid.UUID `db:"target_id" json:"target_id,omitempty"`
+	CreatedAt  time.Time  `db:"created_at" json:"created_at"`
 }
 
 // ----------------- Command ---------------------------------------------------
@@ -177,17 +198,19 @@ type TelemetryEvent struct {
 // ----------------- File ------------------------------------------------------
 
 type FileObject struct {
-	ID          uuid.UUID  `db:"id" json:"id"`
-	TenantID    uuid.UUID  `db:"tenant_id" json:"tenant_id"`
-	Name        string     `db:"name" json:"name"`
-	Kind        string     `db:"kind" json:"kind"` // "apk", "log", "generic"
-	StorageKey  string     `db:"storage_key" json:"storage_key"`
-	SHA256      string     `db:"sha256" json:"sha256"`
-	SizeBytes   int64      `db:"size_bytes" json:"size_bytes"`
-	ContentType string     `db:"content_type" json:"content_type"`
-	UploadedBy  uuid.UUID  `db:"uploaded_by" json:"uploaded_by"`
-	CreatedAt   time.Time  `db:"created_at" json:"created_at"`
-	DeletedAt   *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+	ID               uuid.UUID  `db:"id" json:"id"`
+	TenantID         uuid.UUID  `db:"tenant_id" json:"tenant_id"`
+	Name             string     `db:"name" json:"name"`
+	Kind             string     `db:"kind" json:"kind"` // "apk", "log", "generic", "config", "photo"
+	StorageKey       string     `db:"storage_key" json:"storage_key"`
+	SHA256           string     `db:"sha256" json:"sha256"`
+	SizeBytes        int64      `db:"size_bytes" json:"size_bytes"`
+	ContentType      string     `db:"content_type" json:"content_type"`
+	UploadedBy       *uuid.UUID `db:"uploaded_by" json:"uploaded_by,omitempty"`
+	UploadedByDevice *uuid.UUID `db:"uploaded_by_device" json:"uploaded_by_device,omitempty"`
+	DeviceID         *uuid.UUID `db:"device_id" json:"device_id,omitempty"`
+	CreatedAt        time.Time  `db:"created_at" json:"created_at"`
+	DeletedAt        *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
 }
 
 // ----------------- Audit -----------------------------------------------------

@@ -59,9 +59,17 @@ data class RefreshResponse(
 
 @JsonClass(generateAdapter = true)
 data class PolicyEnvelope(
-    @Json(name = "policy_id") val policyId: String,
-    @Json(name = "version")   val version: Int,
-    @Json(name = "spec")      val spec: Map<String, Any?>
+    @Json(name = "id")      val policyId: String,
+    @Json(name = "version") val version: Int,
+    @Json(name = "spec")    val spec: Map<String, Any?>
+)
+
+@JsonClass(generateAdapter = true)
+data class DeviceUploadResponse(
+    @Json(name = "id")          val id: String,
+    @Json(name = "sha256")      val sha256: String,
+    @Json(name = "size_bytes")  val sizeBytes: Long,
+    @Json(name = "content_type") val contentType: String? = null
 )
 
 // ---------------------------- commands ------------------------------
@@ -101,9 +109,9 @@ data class CommandList(
 
 @JsonClass(generateAdapter = true)
 data class TelemetryEventDto(
-    @Json(name = "kind")      val kind: String,
-    @Json(name = "occurred_at") val occurredAt: String,
-    @Json(name = "data")      val data: Map<String, Any?>
+    @Json(name = "kind")        val kind: String,
+    @Json(name = "captured_at") val occurredAt: String,
+    @Json(name = "payload")     val data: Map<String, Any?>
 )
 
 @JsonClass(generateAdapter = true)
@@ -115,8 +123,17 @@ data class TelemetryBatch(
 @JsonClass(generateAdapter = true)
 data class HeartbeatDto(
     @Json(name = "battery_pct")             val battery: Int? = null,
+    @Json(name = "charging")                val charging: Boolean? = null,
     @Json(name = "network_type")            val network: String? = null,
-    @Json(name = "applied_policy_version")  val appliedPolicyVersion: Int? = null
+    @Json(name = "vpn_active")              val vpnActive: Boolean? = null,
+    @Json(name = "applied_policy_version")  val appliedPolicyVersion: Int? = null,
+    @Json(name = "latitude")                val latitude: Double? = null,
+    @Json(name = "longitude")               val longitude: Double? = null,
+    @Json(name = "location_accuracy_m")     val locationAccuracyM: Float? = null,
+    @Json(name = "ip_address")              val ipAddress: String? = null,
+    @Json(name = "mac_address")             val macAddress: String? = null,
+    @Json(name = "storage_free_bytes")      val storageFreeBytes: Long? = null,
+    @Json(name = "wifi_ssid")               val wifiSsid: String? = null
 )
 
 // ---------------------------- files ---------------------------------

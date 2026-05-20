@@ -79,3 +79,42 @@ func (r *TelemetryRepo) Latest(ctx context.Context, tenantID, deviceID uuid.UUID
 	}
 	return out, nil
 }
+
+// List returns the most recent telemetry events for a device in reverse
+// chronological order. `kindPrefix` is optional: pass "activity." to filter
+// down to the agent's event-log stream while excluding bulk snapshots.
+func (r *TelemetryRepo) List(ctx context.Context, tenantID, deviceID uuid.UUID, limit int, kindPrefix string) ([]models.TelemetryEvent, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	var rows *sqlx.Rows
+	var err error
+	if kindPrefix != "" {
+		rows, err = r.db.QueryxContext(ctx, `
+			SELECT id, tenant_id, device_id, kind, payload, captured_at, received_at
+			  FROM telemetry_events
+			 WHERE tenant_id = $1 AND device_id = $2 AND kind LIKE $3
+			 ORDER BY captured_at DESC
+			 LIMIT $4`, tenantID, deviceID, kindPrefix+"%", limit)
+	} else {
+		rows, err = r.db.QueryxContext(ctx, `
+			SELECT id, tenant_id, device_id, kind, payload, captured_at, received_at
+			  FROM telemetry_events
+			 WHERE tenant_id = $1 AND device_id = $2
+			 ORDER BY captured_at DESC
+			 LIMIT $3`, tenantID, deviceID, limit)
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []models.TelemetryEvent{}
+	for rows.Next() {
+		var e models.TelemetryEvent
+		if err := rows.StructScan(&e); err != nil {
+			return nil, err
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}

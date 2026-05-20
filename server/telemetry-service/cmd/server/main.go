@@ -49,13 +49,24 @@ func main() {
 	app.Use(middleware.RequestLogger(), middleware.Recover(), middleware.Metrics(cfg.ServiceName))
 	app.Get("/healthz", func(c *fiber.Ctx) error { return c.SendString("ok") })
 
-	// Device ingest
-	dev := app.Group("/api/v1/telemetry", middleware.JWTAuth(issuer), middleware.RequireDevice(), middleware.TenantScope())
-	dev.Post("/ingest", h.Ingest)
-
-	// Admin read
-	admin := app.Group("/api/v1/telemetry", middleware.JWTAuth(issuer), middleware.TenantScope())
-	admin.Get("/devices/:deviceID/latest", h.Latest)
+	// IMPORTANT: do NOT use app.Group(prefix, mws...) here. Fiber implements
+	// group middleware via app.Use(prefix, mws...) under the hood, which is
+	// path-bound — so registering a "dev" group at /api/v1/telemetry with
+	// RequireDevice would force EVERY route under that prefix (including the
+	// admin GETs) through RequireDevice, rejecting admin tokens with
+	// "device token required". That's what made the Activity tab look empty
+	// even though events were landing in the DB.
+	//
+	// Per-route middleware avoids the path-bound Use trap entirely.
+	app.Post("/api/v1/telemetry/ingest",
+		middleware.JWTAuth(issuer), middleware.RequireDevice(), middleware.TenantScope(),
+		h.Ingest)
+	app.Get("/api/v1/telemetry/devices/:deviceID/latest",
+		middleware.JWTAuth(issuer), middleware.TenantScope(),
+		h.Latest)
+	app.Get("/api/v1/telemetry/devices/:deviceID/events",
+		middleware.JWTAuth(issuer), middleware.TenantScope(),
+		h.Events)
 
 	go func() {
 		mux := http.NewServeMux()

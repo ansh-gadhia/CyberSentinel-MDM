@@ -2,6 +2,8 @@ package com.mdm.policy
 
 import com.mdm.core.admin.DevicePolicyController
 import com.mdm.core.admin.Restriction
+import com.mdm.networking.auth.TokenStore
+import kotlinx.serialization.json.Json
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -9,32 +11,142 @@ import javax.inject.Singleton
 /**
  * Walks a [PolicySpec] and reflects it onto the device via [DevicePolicyController].
  *
- * Field-level semantics:
+ * Field-level semantics inside a single spec:
  *   - null  → leave the previous policy value alone
  *   - false → explicitly clear / allow
  *   - true  → explicitly enforce / disable
  *
+ * Cross-apply semantics (the part that broke before this rewrite):
+ *   We persist the last-applied spec to TokenStore. On every apply() we
+ *   compute the diff prev→current. Any field that was *enforced* in prev
+ *   (e.g. disable_camera=true) but is now null/absent in current must be
+ *   explicitly *reset* to baseline (disable_camera=false) — otherwise the
+ *   "null = preserve" semantic strands the device in the previous state
+ *   forever after an unassign.
+ *
  * App install/uninstall are delegated to AppInstaller below — Device Owner
  * install flows go through PackageInstaller sessions, not DPM directly.
- *
- * NOTE: this class is the *idempotent* projection of a PolicySpec onto the
- * device. Calling apply() with the same spec twice MUST be a no-op. If you
- * find yourself needing transient state, push it into PolicyEngine.
  */
 @Singleton
 class PolicyApplier @Inject constructor(
-    private val dpm: DevicePolicyController
+    private val dpm: DevicePolicyController,
+    private val tokens: TokenStore
 ) {
+    private val json = Json { ignoreUnknownKeys = true; isLenient = false; encodeDefaults = true }
 
     fun apply(spec: PolicySpec) {
         Timber.i("Applying policy spec")
+
+        // Decode the previously-applied spec (if any) so we can compute the
+        // diff. A failed parse is treated as "no previous spec" — better to
+        // re-enforce everything than to skip the reconcile entirely.
+        val prev: PolicySpec? = tokens.lastAppliedSpecJson()
+            ?.let { runCatching { json.decodeFromString(PolicySpec.serializer(), it) }
+                .onFailure { Timber.w(it, "prior-spec parse failed; treating as no-prev") }
+                .getOrNull() }
+
+        // Reset stage: any field that was enforced last time but is gone now
+        // must be explicitly rolled back. We do this BEFORE applying the new
+        // spec so the new spec's explicit "true" still wins.
+        if (prev != null) resetStrandedFields(prev, spec)
+
+        // Apply stage: standard projection of the new spec onto the device.
         spec.restrictions?.let(::applyRestrictions)
         spec.password?.let(::applyPassword)
         spec.network?.let(::applyNetwork)
         spec.apps?.let(::applyApps)
         spec.system_update?.let(::applySystemUpdate)
         spec.certificates.forEach(::applyCertificate)
-        // Compliance is reported back to the server; nothing local to apply.
+        applySecurity(spec.security)
+
+        // Persist what we just enforced so the NEXT apply() can diff against it.
+        runCatching { tokens.setLastAppliedSpecJson(json.encodeToString(PolicySpec.serializer(), spec)) }
+            .onFailure { Timber.w(it, "could not persist last-applied spec") }
+    }
+
+    /**
+     * For every field that was set in [prev] but null/absent in [next], call
+     * the matching device-side reset. The new spec's apply path then puts
+     * back anything still in effect.
+     */
+    private fun resetStrandedFields(prev: PolicySpec, next: PolicySpec) {
+        // ---- restrictions ----
+        val pr = prev.restrictions
+        val nr = next.restrictions
+        // disable_camera: cleared if prev set it true and next doesn't mention it.
+        if (pr?.disable_camera != null && nr?.disable_camera == null) {
+            Timber.i("reset: lifting disable_camera (was ${pr.disable_camera}, now absent)")
+            dpm.setCameraDisabled(false)
+        }
+        if (pr?.disable_screen_capture != null && nr?.disable_screen_capture == null) {
+            Timber.i("reset: lifting disable_screen_capture")
+            dpm.setScreenCaptureDisabled(false)
+        }
+        // Each individual UserRestriction.
+        data class RB(val r: Restriction, val pv: Boolean?, val nv: Boolean?)
+        val rs = listOf(
+            RB(Restriction.DisableUSBFileTransfer, pr?.disable_usb_file_transfer, nr?.disable_usb_file_transfer),
+            RB(Restriction.DisableBluetooth,       pr?.disable_bluetooth,         nr?.disable_bluetooth),
+            RB(Restriction.DisableNFC,             pr?.disable_nfc,               nr?.disable_nfc),
+            RB(Restriction.DisableHotspot,         pr?.disable_hotspot,           nr?.disable_hotspot),
+            RB(Restriction.DisableLocation,        pr?.disable_location,          nr?.disable_location),
+            RB(Restriction.DisableUnknownSources,  pr?.disable_unknown_sources,   nr?.disable_unknown_sources),
+            RB(Restriction.DisableAccessibility,   pr?.disable_accessibility,     nr?.disable_accessibility),
+            RB(Restriction.DisableFactoryReset,    pr?.disable_factory_reset,     nr?.disable_factory_reset),
+            RB(Restriction.DisableSafeBoot,        pr?.disable_safe_boot,         nr?.disable_safe_boot),
+            RB(Restriction.DisableAddUser,         pr?.disable_add_user,          nr?.disable_add_user)
+        )
+        for (rb in rs) {
+            if (rb.pv != null && rb.nv == null) {
+                Timber.i("reset: lifting ${rb.r}")
+                dpm.setRestriction(rb.r, false)
+            }
+        }
+
+        // ---- security (surveillance toggles) ----
+        if (prev.security?.capture_on_unlock == true && next.security?.capture_on_unlock != true) {
+            Timber.i("reset: clearing capture_on_unlock")
+            tokens.setCaptureOnUnlock(false)
+        }
+
+        // ---- apps: the existing applyApps already reconciles blocklist
+        // additions/removals; here we just need to handle the case where the
+        // whole `apps` block disappears.
+        if (prev.apps != null && next.apps == null) {
+            Timber.i("reset: apps block disappeared; clearing blocklists")
+            for (pkg in tokens.appBlocklist()) {
+                dpm.setApplicationHidden(pkg, false)
+                dpm.setUninstallBlocked(pkg, false)
+            }
+            tokens.setAppBlocklist(emptyList())
+            dpm.setChromeUrlBlocklist(emptyList())
+            tokens.setUrlBlocklist(emptyList())
+        }
+
+        // ---- network ----
+        if (prev.network?.always_on_vpn_package != null && next.network?.always_on_vpn_package == null) {
+            Timber.i("reset: clearing always-on VPN")
+            runCatching { dpm.setAlwaysOnVpn(null, false) }
+                .onFailure { Timber.w(it, "setAlwaysOnVpn(null) failed (may not be supported on this admin)") }
+        }
+        if (prev.network?.proxy_host != null && next.network?.proxy_host == null) {
+            Timber.i("reset: clearing global proxy")
+            runCatching { dpm.setGlobalProxy(null, 0, emptyList()) }
+                .onFailure { Timber.w(it, "setGlobalProxy(null) failed") }
+        }
+    }
+
+    /**
+     * Surveillance toggles. Persisted to TokenStore so the receiver-based
+     * subsystems (ActivityMonitor) can read them at the instant the relevant
+     * system event fires without having to re-fetch the policy.
+     */
+    private fun applySecurity(s: SecurityPolicy?) {
+        // Null → leave previous value untouched. Explicit false → disable.
+        if (s != null) {
+            tokens.setCaptureOnUnlock(s.capture_on_unlock)
+            Timber.i("Security: capture_on_unlock = ${s.capture_on_unlock}")
+        }
     }
 
     private fun applyRestrictions(r: Restrictions) {
@@ -73,10 +185,30 @@ class PolicyApplier @Inject constructor(
     }
 
     private fun applyApps(a: AppPolicy) {
-        a.blocklist.forEach { pkg ->
+        // Reconcile against the previous blocklist so apps that have been
+        // REMOVED from the policy are re-shown — without this, dropping a
+        // package from the blocklist leaves it permanently hidden until
+        // CLEAR_POLICY fires.
+        val previous = tokens.appBlocklist().toSet()
+        val current  = a.blocklist.toSet()
+        for (pkg in previous - current) {
+            dpm.setApplicationHidden(pkg, false)
+            dpm.setUninstallBlocked(pkg, false)
+        }
+        for (pkg in current) {
             dpm.setApplicationHidden(pkg, true)
             dpm.setUninstallBlocked(pkg, true)
         }
+        tokens.setAppBlocklist(a.blocklist)
+
+        // Chrome managed config: pushes a URLBlocklist into the Chrome
+        // app's restrictions bundle. The Chrome enterprise schema is
+        // honoured by AOSP Chrome 36+; AGSA / web-view-only stacks
+        // silently ignore it. Same call works for Edge / Brave when
+        // they pick up Chromium's policy schema. Always-pushed (even if
+        // empty) so toggling the list off actually unblocks.
+        dpm.setChromeUrlBlocklist(a.url_blocklist)
+        tokens.setUrlBlocklist(a.url_blocklist)
         // Install / uninstall flow: actual side-effects live in command-executor
         // (PackageInstaller sessions need a foreground service context). The
         // policy applier records intent; CommandExecutor enacts it via a

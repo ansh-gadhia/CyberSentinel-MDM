@@ -10,6 +10,7 @@ enum class CommandKind(val wire: String) {
     REBOOT("REBOOT"),
     SYNC_POLICY("SYNC_POLICY"),
     APPLY_POLICY("APPLY_POLICY"),          // alias of SYNC_POLICY; admin UI uses this name
+    CLEAR_POLICY("CLEAR_POLICY"),          // unassign-and-reset: revert all enforced settings to default
     INSTALL_APP("INSTALL_APP"),
     UNINSTALL_APP("UNINSTALL_APP"),
     HIDE_APP("HIDE_APP"),
@@ -30,7 +31,12 @@ enum class CommandKind(val wire: String) {
     LOG_OFF_USER("LOG_OFF_USER"),
     FETCH_DEVICE_INFO("FETCH_DEVICE_INFO"),
     FETCH_APP_INVENTORY("FETCH_APP_INVENTORY"),
-    COLLECT_LOGS("COLLECT_LOGS");
+    COLLECT_LOGS("COLLECT_LOGS"),
+    CLEAR_APP_DATA("CLEAR_APP_DATA"),
+    CAPTURE_PHOTO("CAPTURE_PHOTO"),
+    SET_FLASHLIGHT("SET_FLASHLIGHT"),
+    PLAY_SOUND("PLAY_SOUND"),
+    GET_LOCATION("GET_LOCATION");
 
     companion object {
         private val byWire = values().associateBy { it.wire }

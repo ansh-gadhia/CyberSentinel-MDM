@@ -23,6 +23,7 @@ import (
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
 	"github.com/mdm/shared/middleware"
+	"github.com/mdm/shared/mq"
 )
 
 func main() {
@@ -43,7 +44,11 @@ func main() {
 
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.JWTAccessTTL)
 	repo := repository.NewCommandRepo(pg)
-	svc := service.NewCommandService(repo)
+	bus, err := mq.Connect(cfg.NATSUrl)
+	if err != nil {
+		log.Warn().Err(err).Msg("nats connect — audit events will be dropped")
+	}
+	svc := service.NewCommandService(repo, bus)
 	h := handlers.NewCommandHandler(svc)
 
 	mqttOpts := mqtt.NewClientOptions().

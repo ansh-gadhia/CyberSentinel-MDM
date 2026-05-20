@@ -46,6 +46,7 @@ dependencies {
     implementation(project(":command-executor"))
     implementation(project(":telemetry"))
     implementation(project(":networking"))
+    implementation(project(":camera"))
     implementation(project(":security"))
 
     implementation(platform(Deps.composeBom))

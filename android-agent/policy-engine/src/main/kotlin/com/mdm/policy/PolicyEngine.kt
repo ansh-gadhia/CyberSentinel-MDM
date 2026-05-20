@@ -33,9 +33,26 @@ class PolicyEngine @Inject constructor(
     private val anyAdapter = moshi.adapter<Map<String, Any?>>(
         com.squareup.moshi.Types.newParameterizedType(Map::class.java, String::class.java, Any::class.java)
     )
-    private val json = Json { ignoreUnknownKeys = false; isLenient = false }
+    // ignoreUnknownKeys=true: the server's PolicySpec and the agent's
+    // PolicySpec evolve independently. A new server-side field (e.g.
+    // top-level "version", a newer compliance check) must NOT make the
+    // agent's parse fail — that turns APPLY_POLICY into a silent no-op
+    // (the command shows succeeded with {} result, nothing actually applies).
+    // Strictness lives in policy authoring (linter on save), not at the
+    // device-side decoder.
+    private val json = Json { ignoreUnknownKeys = true; isLenient = false }
 
     private var lastVersion: Int = 0
+
+    /**
+     * Resets the cached "last applied policy version" so the next APPLY_POLICY
+     * isn't short-circuited as "unchanged". CLEAR_POLICY calls this so that a
+     * subsequent reassignment doesn't no-op the way `if env.version == lastVersion`
+     * normally does.
+     */
+    fun resetLocalVersion() {
+        lastVersion = 0
+    }
 
     /** Returns the version applied, or null if no sync happened. */
     @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
@@ -60,10 +77,13 @@ class PolicyEngine @Inject constructor(
             .onFailure { Timber.e(it, "policy spec parse failed; raw=$raw") }
             .getOrNull() ?: return@withContext null
 
+        Timber.i("Applying policy v${env.version} (${env.policyId}): " +
+                 "restrictions=${spec.restrictions != null} apps=${spec.apps != null} " +
+                 "security=${spec.security != null} blocklist=${spec.apps?.blocklist?.size ?: 0} " +
+                 "url_blocklist=${spec.apps?.url_blocklist?.size ?: 0} " +
+                 "capture_on_unlock=${spec.security?.capture_on_unlock}")
         applier.apply(spec)
         lastVersion = env.version
-        // The server has no policy-ack endpoint today; local last_version is
-        // tracked instead. If we add one later, ack from here.
         Timber.i("policy v${env.version} applied (${env.policyId})")
         env.version
     }

@@ -98,7 +98,13 @@ class EnrollmentManager @Inject constructor(
     }
 
     private companion object {
-        const val DEFAULT_ACCESS_LIFE_S = 3600L
+        // Must match the server's JWT_ACCESS_TTL (default 15m in
+        // docker-compose.yml and k8s/namespace.yaml). If this is set too
+        // long, AuthRepository.ensureAccessToken won't pre-refresh before
+        // the server's real expiry, the agent gets 401s on every call,
+        // and (until the AuthRepository fix) refreshNow's clock guard
+        // returns the stale token, locking the agent out forever.
+        const val DEFAULT_ACCESS_LIFE_S = 15L * 60L
         const val DEFAULT_MQTT_PORT = 1883
     }
 }

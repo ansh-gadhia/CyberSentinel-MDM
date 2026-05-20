@@ -43,6 +43,21 @@ func (r *CommandRepo) Get(ctx context.Context, tenantID, id uuid.UUID) (*models.
 	return out, nil
 }
 
+// GetByID looks up a command without a tenant scope — used by the device-facing
+// result handler where we have the command id from the JWT-authenticated device
+// but no admin tenant context.
+func (r *CommandRepo) GetByID(ctx context.Context, id uuid.UUID) (*models.Command, error) {
+	const q = `SELECT * FROM commands WHERE id = $1`
+	out := &models.Command{}
+	if err := r.db.GetContext(ctx, out, q, id); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return out, nil
+}
+
 // ClaimPending atomically grabs pending commands for a device, marks them
 // dispatched, and returns them. Used both by the polling fallback endpoint and
 // by the MQTT dispatcher's reconciliation loop.

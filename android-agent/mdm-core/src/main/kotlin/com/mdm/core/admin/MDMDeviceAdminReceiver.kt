@@ -64,6 +64,12 @@ class MDMDeviceAdminReceiver : DeviceAdminReceiver() {
         // continue out of Setup.
         dpm.setProfileEnabled(admin)
 
+        // Pre-grant every runtime permission the agent will ever need so the
+        // first CAPTURE_PHOTO / GET_LOCATION / etc. command doesn't hit a
+        // system permission dialog. Cheap and idempotent.
+        runCatching { DevicePolicyController(context.applicationContext).applyDeviceOwnerPermissionDefaults() }
+            .onFailure { Timber.w(it, "pre-grant permissions failed at provisioning") }
+
         // Start command channel now that we're Device Owner.
         startCommandService(context)
     }

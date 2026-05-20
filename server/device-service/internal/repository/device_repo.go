@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
@@ -124,19 +125,77 @@ func itoa(i int) string {
 	return string(b)
 }
 
-func (r *DeviceRepo) Heartbeat(ctx context.Context, id uuid.UUID, appliedVer *int) error {
+// Heartbeat updates last_heartbeat_at, marks the device back online if it had
+// drifted to 'offline', and folds in optional rich telemetry (applied policy
+// version, last-known location, last IP/MAC, VPN status, battery/charging,
+// free storage, WiFi SSID). All optional fields use COALESCE-style dynamic
+// SQL so a partial heartbeat doesn't clobber previously-known values.
+type HeartbeatRich struct {
+	AppliedVer          *int
+	Latitude, Longitude *float64
+	AccuracyM           *float32
+	IPAddress           *string
+	MACAddress          *string
+	BatteryPct          *int
+	Charging            *bool
+	VpnActive           *bool
+	StorageFreeBytes    *int64
+	WifiSsid            *string
+	NetworkType         *string
+}
+
+func (r *DeviceRepo) Heartbeat(ctx context.Context, id uuid.UUID, hb HeartbeatRich) error {
 	now := time.Now()
-	if appliedVer != nil {
-		_, err := r.db.ExecContext(ctx, `
-			UPDATE devices SET last_heartbeat_at = $1, applied_policy_version = $2,
-			       state = CASE WHEN state = 'offline' THEN 'enrolled' ELSE state END
-			 WHERE id = $3`, now, *appliedVer, id)
-		return err
+	var locUpdate string
+	args := []any{now, id}
+	idx := 3
+
+	appendField := func(value any, column string) {
+		args = append(args, value)
+		locUpdate += fmt.Sprintf(", %s = $%d", column, idx)
+		idx++
 	}
-	_, err := r.db.ExecContext(ctx, `
-		UPDATE devices SET last_heartbeat_at = $1,
-		       state = CASE WHEN state = 'offline' THEN 'enrolled' ELSE state END
-		 WHERE id = $2`, now, id)
+
+	if hb.AppliedVer != nil {
+		appendField(*hb.AppliedVer, "applied_policy_version")
+	}
+	if hb.Latitude != nil && hb.Longitude != nil {
+		args = append(args, *hb.Latitude, *hb.Longitude, now)
+		locUpdate += fmt.Sprintf(", last_latitude = $%d, last_longitude = $%d, last_location_at = $%d", idx, idx+1, idx+2)
+		idx += 3
+		if hb.AccuracyM != nil {
+			appendField(*hb.AccuracyM, "last_location_accuracy_m")
+		}
+	}
+	if hb.IPAddress != nil {
+		appendField(*hb.IPAddress, "last_ip_address")
+	}
+	if hb.MACAddress != nil {
+		appendField(*hb.MACAddress, "last_mac_address")
+	}
+	if hb.BatteryPct != nil {
+		appendField(*hb.BatteryPct, "last_battery_pct")
+	}
+	if hb.Charging != nil {
+		appendField(*hb.Charging, "last_charging")
+	}
+	if hb.VpnActive != nil {
+		appendField(*hb.VpnActive, "last_vpn_active")
+	}
+	if hb.StorageFreeBytes != nil {
+		appendField(*hb.StorageFreeBytes, "last_storage_free_bytes")
+	}
+	if hb.WifiSsid != nil {
+		appendField(*hb.WifiSsid, "last_wifi_ssid")
+	}
+	if hb.NetworkType != nil {
+		appendField(*hb.NetworkType, "last_network_type")
+	}
+
+	q := fmt.Sprintf(`UPDATE devices SET last_heartbeat_at = $1,
+	       state = CASE WHEN state = 'offline' THEN 'enrolled' ELSE state END%s
+	   WHERE id = $2`, locUpdate)
+	_, err := r.db.ExecContext(ctx, q, args...)
 	return err
 }
 

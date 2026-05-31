@@ -85,6 +85,7 @@ type Device struct {
 	Model               *string         `db:"model" json:"model,omitempty"`
 	OSVersion           *string         `db:"os_version" json:"os_version,omitempty"`
 	SecurityPatchLevel  *string         `db:"security_patch_level" json:"security_patch_level,omitempty"`
+	Alias               *string         `db:"alias" json:"alias,omitempty"`
 	State               DeviceState     `db:"state" json:"state"`
 	LastHeartbeatAt     *time.Time      `db:"last_heartbeat_at" json:"last_heartbeat_at,omitempty"`
 	AssignedPolicyID    *uuid.UUID      `db:"assigned_policy_id" json:"assigned_policy_id,omitempty"`
@@ -101,6 +102,8 @@ type Device struct {
 	LastStorageFreeBytes *int64         `db:"last_storage_free_bytes" json:"last_storage_free_bytes,omitempty"`
 	LastWifiSsid        *string         `db:"last_wifi_ssid" json:"last_wifi_ssid,omitempty"`
 	LastNetworkType     *string         `db:"last_network_type" json:"last_network_type,omitempty"`
+	LastMgmtMode        *string         `db:"last_mgmt_mode" json:"last_mgmt_mode,omitempty"` // owner | admin | none
+
 	GroupID             *uuid.UUID      `db:"group_id" json:"group_id,omitempty"`
 	Tags                json.RawMessage `db:"tags" json:"tags,omitempty"`
 	Metadata            json.RawMessage `db:"metadata" json:"metadata,omitempty"`
@@ -108,6 +111,24 @@ type Device struct {
 	UpdatedAt           time.Time       `db:"updated_at" json:"updated_at"`
 	DeletedAt           *time.Time      `db:"deleted_at" json:"deleted_at,omitempty"`
 	Version             int             `db:"version" json:"version"` // optimistic locking
+}
+
+// ----------------- Device Group ----------------------------------------------
+
+// DeviceGroup is a tenant-scoped label for classifying devices (e.g.
+// "Employees", "Interns"). Policies assigned to a group apply to every device
+// whose group_id matches — resolved/merged by policy-service alongside
+// device- and tenant-level assignments.
+type DeviceGroup struct {
+	ID          uuid.UUID  `db:"id" json:"id"`
+	TenantID    uuid.UUID  `db:"tenant_id" json:"tenant_id"`
+	Name        string     `db:"name" json:"name"`
+	Description *string    `db:"description" json:"description,omitempty"`
+	CreatedAt   time.Time  `db:"created_at" json:"created_at"`
+	UpdatedAt   time.Time  `db:"updated_at" json:"updated_at"`
+	DeletedAt   *time.Time `db:"deleted_at" json:"deleted_at,omitempty"`
+	// DeviceCount is populated by list queries (not a column).
+	DeviceCount int `db:"device_count" json:"device_count"`
 }
 
 // ----------------- Enrollment Token ------------------------------------------

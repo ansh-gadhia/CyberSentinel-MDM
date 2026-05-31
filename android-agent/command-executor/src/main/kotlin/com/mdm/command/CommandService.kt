@@ -90,6 +90,13 @@ class CommandService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // Re-assert the foreground notification + FG service types on every
+        // (re)start. This is how a sensor permission granted AFTER the service
+        // first came up (e.g. the user grants CAMERA via the Permissions panel
+        // in Device Admin / enrolled-only mode) gets folded into the FGS type
+        // mask — letting a subsequent photo/audio capture actually run.
+        runCatching { startForegroundSafely() }
+            .onFailure { Timber.w(it, "re-assert foreground failed") }
         ensureWired()
         return START_STICKY
     }
@@ -150,6 +157,16 @@ class CommandService : Service() {
                             val fresh = runCatching { locator.get(timeoutMs = 5_000L) }.getOrNull()
                             if (fresh != null) { cachedLoc = fresh; lastLocAt = now }
                         }
+                        // Report current privilege level every heartbeat so the
+                        // admin UI tracks owner/admin/none transitions live —
+                        // e.g. an enrolled-only install promoted to Device Owner
+                        // flips in the dashboard within a heartbeat, no manual
+                        // FETCH_DEVICE_INFO needed.
+                        val mgmtMode = when {
+                            dpm.isDeviceOwner() -> "owner"
+                            dpm.isAdminActive() -> "admin"
+                            else                -> "none"
+                        }
                         api.postHeartbeat(HeartbeatDto(
                             battery = s.batteryPct.takeIf { it >= 0 },
                             charging = s.charging,
@@ -162,7 +179,8 @@ class CommandService : Service() {
                             ipAddress = s.ipAddress,
                             macAddress = s.macAddress,
                             storageFreeBytes = s.storageFreeBytes.takeIf { it >= 0 },
-                            wifiSsid = s.ssid
+                            wifiSsid = s.ssid,
+                            mgmtMode = mgmtMode
                         ))
                     }
                 } catch (t: Throwable) {
@@ -246,20 +264,34 @@ class CommandService : Service() {
             .setPriority(androidx.core.app.NotificationCompat.PRIORITY_MIN)
             .build()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            // Android 14+ requires the active FG service types to be declared
-            // when calling startForeground. We OR every type we will actually
-            // use: DATA_SYNC (always), CAMERA (for CAPTURE_PHOTO) and LOCATION
-            // (for GET_LOCATION / live tracking).
-            startForeground(
-                NOTIF_ID, notif,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA or
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
-            )
+            // Android 14+ rejects startForeground for a camera/microphone/
+            // location FGS type unless the matching runtime permission is held
+            // RIGHT NOW. In Device Owner mode they're auto-granted; in Device
+            // Admin / enrolled-only mode they may not be yet — so we must only
+            // declare the types we currently hold, or the service crashes on
+            // start (which would break enrolled-only mode entirely). DATA_SYNC
+            // is always safe and keeps the heartbeat/command channel alive; the
+            // sensor types get added on a later (re)start once the user grants
+            // the permission via the in-app Permissions panel.
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            if (hasPerm(android.Manifest.permission.CAMERA)) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+            }
+            if (hasPerm(android.Manifest.permission.RECORD_AUDIO)) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            if (hasPerm(android.Manifest.permission.ACCESS_FINE_LOCATION) ||
+                hasPerm(android.Manifest.permission.ACCESS_COARSE_LOCATION)) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION
+            }
+            startForeground(NOTIF_ID, notif, types)
         } else {
             startForeground(NOTIF_ID, notif)
         }
     }
+
+    private fun hasPerm(permission: String): Boolean =
+        checkSelfPermission(permission) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
     companion object {
         private const val CHANNEL_ID = "mdm_agent"

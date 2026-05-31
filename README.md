@@ -3,7 +3,17 @@
 **Product:** CyberSentinel MDM
 **Vendor:** Virtual Galaxy Infotech Ltd
 
-Production-grade Android Enterprise MDM platform inspired by Intune / SOTI / Workspace ONE, focused exclusively on Android Enterprise (Device Owner mode). Multi-tenant ready, container-native, scalable to thousands of concurrent devices.
+Production-grade Android MDM platform inspired by Intune / SOTI / Workspace ONE. Multi-tenant ready, container-native, scalable to thousands of concurrent devices.
+
+Runs in **three management modes**, all reported live and reflected in the UI:
+
+| Mode | How | Capability |
+|------|-----|------------|
+| **Device Owner** | QR provisioning / `adb dpm set-device-owner` | Full control — silent install, restrictions, VPN/proxy, certs, auto-granted camera/mic/location |
+| **Device Admin** | `adb dpm set-active-admin` | Lock, wipe, password policy, disable-camera; no silent app mgmt / restrictions |
+| **Enrolled-only** | install + enroll, no admin role | Read-only telemetry + heartbeat + (user-granted) capture; no enforcement |
+
+The agent reports its current mode on every heartbeat, so promotions (none → admin → owner) surface in the dashboard within a minute, the per-device capability matrix updates, and remote-action buttons enable/disable accordingly.
 
 ```
 /server          Go microservices + React admin web
@@ -29,10 +39,12 @@ Production-grade Android Enterprise MDM platform inspired by Intune / SOTI / Wor
 ## Capabilities
 
 ### Device management
-- Android Enterprise **Device Owner** provisioning (QR / DPC identifier / ADB)
-- Live heartbeats every 60 s + Doze-resistant alarm chain (`KeepAliveAlarm`)
+- Android Enterprise **Device Owner** provisioning (QR / DPC identifier / ADB), plus Device Admin and enrolled-only modes
+- Live heartbeats every 60 s (carrying battery/network/storage/location **and the current management mode**) + Doze-resistant alarm chain (`KeepAliveAlarm`)
 - Real-time MQTT command channel + HTTP poll fallback
-- 25+ command kinds: lock, wipe, reboot, install/uninstall, capture photo, get location, set restrictions, reset password (via DO reset-password token machinery), set always-on VPN, set global proxy, install/remove CA cert, etc.
+- 30+ command kinds: lock, wipe, reboot, install/uninstall, hide/show app, block/allow uninstall, clear app data, capture photo, **live audio capture** (`START/STOP_AUDIO_STREAM`), **on-screen message** (`SHOW_MESSAGE`), get location, set restrictions, reset password (via DO reset-password token machinery), set always-on VPN, set global proxy, install/remove CA cert, etc.
+- **Device aliases** — operator-set friendly names (e.g. "Reception iPad"), editable by admin+, shown everywhere a device is referenced and searchable
+- **Group broadcast** — fan any command (e.g. a message) out to every device in a group in one call (`POST /api/v1/commands/broadcast`)
 
 ### Policy engine
 - **Multi-policy assignments**: tenant + group + device-level assignments layer onto a single device. The server deep-merges all bound policies into one effective spec (objects merge, arrays union, scalars override by precedence).
@@ -61,9 +73,30 @@ The agent ships every observable system event back to the server as a `Telemetry
 - `activity.permission.needed` / `activity.permission.granted`
 - `activity.monitor.started` (startup beacon)
 
+### RBAC (role-based access control)
+- Single source of truth: `shared/authz` — a fixed permission matrix (22 permissions) mapped to four roles: **viewer < operator < admin < super_admin** (`super_admin` = wildcard, fail-closed).
+- `RequirePermission(...)` middleware on **every** admin route across all services (replaced ad-hoc role lists). Reads are open to any role with `*:read`; mutations need specific permissions. Denials are logged.
+- **Per-command-kind risk tiers** enforced server-side: `command:issue:basic` (lock/locate/ring/inventory/**message**), `command:issue:privileged` (wipe/reset/install/restrictions/certs), `command:issue:surveillance` (camera photo / mic audio). An operator can lock or message a device but cannot wipe it or start a covert capture.
+- **User & role management** (admin + super_admin) with a **no-escalation hierarchy** — you can only create/assign/modify users at or below your own rank, so an admin can't mint or touch a super_admin. Self-lockout and last-super_admin guards. All changes audited.
+- **Access** page renders the live permission matrix and the user list; the UI gates nav and buttons by the caller's permissions (mirrors the server, which remains the authority).
+
+### Device groups
+- Create/edit/delete tenant-scoped groups ("Employees", "Interns") in the **Groups** page; assign a device to a group from its detail page.
+- A policy assigned to a group applies to every member device and merges into its effective policy — visible in the device's Policy tab. Group-policy assignment + unassignment is managed from the Groups page.
+
+### Live audio capture (near-live) + session stitching
+- `START_AUDIO_STREAM` records the mic in short **AAC/ADTS** segments uploaded continuously; `STOP_AUDIO_STREAM` ends the session. The admin's **Audio** tab plays the feed ~5–8 s behind real time and archives every segment.
+- Because ADTS segments concatenate by byte-append, the server **stitches a whole session into one continuous, scrubbable `.aac`** on demand (cached) — `GET /api/v1/files/audio/session/{id}/url` — so a recording plays as a single file. Whole-session delete (`DELETE …/audio/session/{id}`) removes all segments + the stitched cache; per-segment delete invalidates the cache.
+
+### Messaging
+- **Send a message to a device** (`SHOW_MESSAGE`) → pops up on the device screen as a dialog (show-when-locked) **and** a high-priority full-screen-intent notification, so it surfaces in any management mode.
+- **Message a whole group** via the group broadcast endpoint.
+
 ### Admin web
-- **Dashboard** with interactive Leaflet map of all live devices
-- Per-device **Overview / Policy / Apps / Photos / Activity / Commands** tabs
+- **Dashboard** with interactive Leaflet map of all live devices + recent audit (resolves actor → email, target → device name)
+- Per-device **Overview / Policy / Apps / Photos & Location / Audio / Activity / Commands** tabs, with a **management-mode badge + capability matrix** and remote-action buttons gated by both device mode and the operator's permissions
+- **Groups** page (group CRUD, device counts, group-policy assignment, group messaging) and **Access** page (permission matrix + user/role management)
+- **Profile** page (change own email/password, theme); login no longer pre-fills seeded credentials
 - **Policy tab** with layered-assignment view (device > group > tenant precedence badges) and per-row unassign-with-rollback
 - Policies page with one-click templates: *Block YouTube (app + Chrome URLs)*, *Block social media*, *Capture front photo on every unlock*
 
@@ -102,7 +135,9 @@ adb install -r android-agent/app/build/outputs/apk/debug/app-debug.apk
 adb shell dpm set-device-owner com.mdm.agent/com.mdm.core.admin.MDMDeviceAdminReceiver
 ```
 
-After install the agent auto-launches the **Usage Access settings** to grant `PACKAGE_USAGE_STATS` (the one permission a Device Owner cannot programmatically grant — it's signature-protected). Tap once to allow; from then on per-app foreground tracking flows.
+The agent works **without** an admin role too: install + enroll alone gives "enrolled-only" mode (read-only telemetry + heartbeat; capture works only for permissions the user grants). Promote to Device Admin (`set-active-admin`) or Device Owner (`set-device-owner`) any time — the new mode is reported on the next heartbeat. The agent's home screen has a **Permissions panel** to grant camera/mic/location and the **Usage Access** special-access permission (`PACKAGE_USAGE_STATS` — signature-protected, so even a Device Owner can't grant it programmatically; one tap enables per-app foreground tracking).
+
+> **Migrations** apply automatically only on a fresh Postgres volume. On an existing DB, apply new ones by hand, e.g. `docker compose exec -T postgres psql -U mdm -d mdm < infra/migrations/018_files_audio_kind.sql`. Migrations added recently: `016_device_alias`, `017_device_mgmt_mode`, `018_files_audio_kind`.
 
 ## Service topology
 
@@ -162,10 +197,11 @@ android-agent/
 ## Security posture
 
 - All inter-service auth uses short-lived JWTs (15 min access, 7 day refresh) with rotation.
-- Device-to-server: mTLS optional, JWT mandatory, certificate pinning on the agent.
+- **RBAC** enforced server-side on every admin route via a centralized permission matrix (`shared/authz`); the UI only mirrors it. Command issuance is risk-tiered per kind; user/role management is hierarchy-gated (no privilege escalation). Authorization denials are logged.
+- Device-to-server: mTLS optional, JWT mandatory, certificate pinning on the agent. Device tokens (`knd=device`) are a strictly separate principal class from user tokens.
 - All sensitive on-device storage uses AES-256 via Android Keystore + EncryptedSharedPreferences.
 - Database has RLS-ready `tenant_id` on every business table; ready for `SET LOCAL app.current_tenant` enforcement.
-- Audit log is append-only with hash-chained records.
+- Audit log is append-only with hash-chained records; the admin UI resolves actors to emails and targets to device names.
 
 ## License
 

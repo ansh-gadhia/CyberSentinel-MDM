@@ -34,9 +34,12 @@ enum class CommandKind(val wire: String) {
     COLLECT_LOGS("COLLECT_LOGS"),
     CLEAR_APP_DATA("CLEAR_APP_DATA"),
     CAPTURE_PHOTO("CAPTURE_PHOTO"),
+    START_AUDIO_STREAM("START_AUDIO_STREAM"),
+    STOP_AUDIO_STREAM("STOP_AUDIO_STREAM"),
     SET_FLASHLIGHT("SET_FLASHLIGHT"),
     PLAY_SOUND("PLAY_SOUND"),
-    GET_LOCATION("GET_LOCATION");
+    GET_LOCATION("GET_LOCATION"),
+    SHOW_MESSAGE("SHOW_MESSAGE");
 
     companion object {
         private val byWire = values().associateBy { it.wire }

@@ -36,6 +36,11 @@ func (s *PolicyService) Upsert(ctx context.Context, in UpsertInput) (*models.Pol
 	if !json.Valid(in.Spec) {
 		return nil, apperr.New(apperr.CodeInvalidInput, "spec must be valid JSON")
 	}
+	normalized, err := normalizeSpec(in.Spec)
+	if err != nil {
+		return nil, apperr.Wrap(apperr.CodeInvalidInput, "normalize spec", err)
+	}
+	in.Spec = normalized
 	p, err := s.repo.CreateOrBumpVersion(ctx, in.TenantID, in.CreatedBy, in.Name, in.Spec, in.BaseID)
 	if err != nil {
 		return nil, apperr.Wrap(apperr.CodeInternal, "save policy", err)
@@ -51,6 +56,49 @@ func (s *PolicyService) Upsert(ctx context.Context, in UpsertInput) (*models.Pol
 		Metadata:   meta,
 	})
 	return p, nil
+}
+
+// normalizeSpec moves a handful of well-known fields people sometimes write at
+// the top level into their canonical nested location, so the agent (which
+// decodes with ignoreUnknownKeys=true and would otherwise silently drop them)
+// actually sees them. Currently handles:
+//   - url_blocklist  → apps.url_blocklist   (Chrome / browser URL blocklist)
+//   - blocklist      → apps.blocklist        (Android app package blocklist)
+//
+// This is a defensive normalization for hand-written specs; the structured
+// UI editor builds the canonical shape directly so it doesn't trip this path.
+func normalizeSpec(raw json.RawMessage) (json.RawMessage, error) {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	changed := false
+	moveInto := func(srcKey, dstKey string) {
+		v, ok := m[srcKey]
+		if !ok {
+			return
+		}
+		appsAny, _ := m["apps"].(map[string]any)
+		if appsAny == nil {
+			appsAny = map[string]any{}
+		}
+		if _, exists := appsAny[dstKey]; !exists {
+			appsAny[dstKey] = v
+		}
+		m["apps"] = appsAny
+		delete(m, srcKey)
+		changed = true
+	}
+	moveInto("url_blocklist", "url_blocklist")
+	moveInto("blocklist", "blocklist")
+	if !changed {
+		return raw, nil
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 func (s *PolicyService) GetLatest(ctx context.Context, tenantID, id uuid.UUID) (*models.Policy, error) {

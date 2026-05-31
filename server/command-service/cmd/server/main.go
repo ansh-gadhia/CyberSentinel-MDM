@@ -19,6 +19,7 @@ import (
 	"github.com/mdm/command-service/internal/repository"
 	"github.com/mdm/command-service/internal/service"
 	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 	"github.com/mdm/shared/config"
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
@@ -74,9 +75,14 @@ func main() {
 	app.Get("/healthz", func(c *fiber.Ctx) error { return c.SendString("ok") })
 
 	admin := app.Group("/api/v1/commands", middleware.JWTAuth(issuer), middleware.TenantScope())
-	admin.Post("/", middleware.RequireRole("super_admin", "admin", "operator"), h.Create)
-	admin.Get("/:id", h.Get)
-	admin.Get("/by-device/:deviceID", h.ListForDevice)
+	// Baseline gate: any role that can issue commands at all (operator+). The
+	// per-command-kind risk tier (basic / privileged / surveillance) is then
+	// enforced inside the handler via authz.CommandPermission — so an operator
+	// can LOCK/locate but not WIPE or start a covert audio stream.
+	admin.Post("/", middleware.RequirePermission(authz.PermCommandBasic), h.Create)
+	admin.Post("/broadcast", middleware.RequirePermission(authz.PermCommandBasic), h.Broadcast)
+	admin.Get("/:id", middleware.RequirePermission(authz.PermCommandRead), h.Get)
+	admin.Get("/by-device/:deviceID", middleware.RequirePermission(authz.PermCommandRead), h.ListForDevice)
 
 	dev := app.Group("/api/v1/commands", middleware.JWTAuth(issuer))
 	dev.Get("/poll", middleware.RequireDevice(), h.Poll)

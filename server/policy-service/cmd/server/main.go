@@ -16,6 +16,7 @@ import (
 	"github.com/mdm/policy-service/internal/repository"
 	"github.com/mdm/policy-service/internal/service"
 	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 	"github.com/mdm/shared/config"
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
@@ -67,17 +68,17 @@ func main() {
 		middleware.JWTAuth(issuer), middleware.RequireDevice(), middleware.TenantScope(), h.AssignedForDevice)
 
 	admin := app.Group("/api/v1/policies", middleware.JWTAuth(issuer), middleware.TenantScope())
-	admin.Get("/", h.List)
-	admin.Post("/", middleware.RequireRole("super_admin", "admin"), h.Upsert)
-	admin.Get("/resolved-for/:deviceID", h.ResolvedForDevice)
-	admin.Get("/for-device/:deviceID", h.AssignmentsForDevice)
-	admin.Get("/:id", h.Get)
-	admin.Get("/:id/diff", h.Diff)
-	admin.Get("/:id/assignments", h.ListAssignments)
-	admin.Post("/:id/versions", middleware.RequireRole("super_admin", "admin"), h.Upsert)
-	admin.Delete("/:id", middleware.RequireRole("super_admin", "admin"), h.Delete)
-	admin.Post("/assign", middleware.RequireRole("super_admin", "admin"), h.Assign)
-	admin.Post("/unassign", middleware.RequireRole("super_admin", "admin"), h.Unassign)
+	admin.Get("/", middleware.RequirePermission(authz.PermPolicyRead), h.List)
+	admin.Post("/", middleware.RequirePermission(authz.PermPolicyWrite), h.Upsert)
+	admin.Get("/resolved-for/:deviceID", middleware.RequirePermission(authz.PermPolicyRead), h.ResolvedForDevice)
+	admin.Get("/for-device/:deviceID", middleware.RequirePermission(authz.PermPolicyRead), h.AssignmentsForDevice)
+	admin.Get("/:id", middleware.RequirePermission(authz.PermPolicyRead), h.Get)
+	admin.Get("/:id/diff", middleware.RequirePermission(authz.PermPolicyRead), h.Diff)
+	admin.Get("/:id/assignments", middleware.RequirePermission(authz.PermPolicyRead), h.ListAssignments)
+	admin.Post("/:id/versions", middleware.RequirePermission(authz.PermPolicyWrite), h.Upsert)
+	admin.Delete("/:id", middleware.RequirePermission(authz.PermPolicyWrite), h.Delete)
+	admin.Post("/assign", middleware.RequirePermission(authz.PermPolicyAssign), h.Assign)
+	admin.Post("/unassign", middleware.RequirePermission(authz.PermPolicyAssign), h.Unassign)
 
 	go func() {
 		mux := http.NewServeMux()

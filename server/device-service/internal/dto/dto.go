@@ -68,6 +68,30 @@ type HeartbeatRequest struct {
 	MACAddress         *string  `json:"mac_address,omitempty"`
 	StorageFreeBytes   *int64   `json:"storage_free_bytes,omitempty"`
 	WifiSsid           *string  `json:"wifi_ssid,omitempty"`
+	MgmtMode           *string  `json:"mgmt_mode,omitempty"` // owner | admin | none
+}
+
+// UpdateDeviceRequest is the admin-side PATCH /devices/:id body. Only the
+// fields present are touched; today that's the alias. `alias` is a pointer so
+// the handler can tell "not supplied" (nil → no change) apart from "clear it"
+// (explicit empty string).
+type UpdateDeviceRequest struct {
+	Alias *string `json:"alias,omitempty"`
+	// GroupID: a UUID string to assign the device to a group, or an explicit
+	// empty string "" to clear group membership. Omitted (nil) = no change.
+	GroupID *string `json:"group_id,omitempty"`
+}
+
+// ---------- device groups ----------
+
+type CreateGroupRequest struct {
+	Name        string  `json:"name"`
+	Description *string `json:"description,omitempty"`
+}
+
+type UpdateGroupRequest struct {
+	Name        *string `json:"name,omitempty"`
+	Description *string `json:"description,omitempty"`
 }
 
 type UpdateDeviceInfoRequest struct {

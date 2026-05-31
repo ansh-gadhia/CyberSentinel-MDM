@@ -18,6 +18,7 @@ import (
 	"github.com/mdm/audit-service/internal/handlers"
 	"github.com/mdm/audit-service/internal/repository"
 	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 	"github.com/mdm/shared/config"
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
@@ -64,8 +65,8 @@ func main() {
 	app.Get("/healthz", func(c *fiber.Ctx) error { return c.SendString("ok") })
 
 	g := app.Group("/api/v1/audit", middleware.JWTAuth(issuer), middleware.TenantScope())
-	g.Get("/", h.List)
-	g.Post("/", middleware.RequireRole("super_admin", "admin"), h.Append)
+	g.Get("/", middleware.RequirePermission(authz.PermAuditRead), h.List)
+	g.Post("/", middleware.RequirePermission(authz.PermAuditWrite), h.Append)
 
 	go func() {
 		mux := http.NewServeMux()

@@ -5,7 +5,10 @@ import (
 	"strings"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/rs/zerolog/log"
+
 	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 )
 
 const (
@@ -55,6 +58,33 @@ func RequireRole(roles ...string) fiber.Handler {
 			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "insufficient role"})
 		}
 		return c.Next()
+	}
+}
+
+// RequirePermission enforces the RBAC permission matrix (shared/authz). The
+// caller must present a user token whose role grants AT LEAST ONE of the given
+// permissions. This is the preferred guard for all admin-side routes — it keeps
+// the role→capability mapping in one place instead of scattering role lists
+// across services. Denials are logged for forensics and fail closed.
+func RequirePermission(perms ...authz.Permission) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		claims, _ := c.Locals(CtxClaims).(*auth.Claims)
+		if claims == nil || claims.Kind != auth.KindUser {
+			return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "user token required"})
+		}
+		for _, p := range perms {
+			if authz.Can(claims.Role, p) {
+				return c.Next()
+			}
+		}
+		log.Warn().
+			Str("role", claims.Role).
+			Str("subject", claims.Subject).
+			Str("method", c.Method()).
+			Str("path", c.Path()).
+			Interface("required", perms).
+			Msg("authz: permission denied")
+		return c.Status(fiber.StatusForbidden).JSON(fiber.Map{"error": "insufficient permissions"})
 	}
 }
 

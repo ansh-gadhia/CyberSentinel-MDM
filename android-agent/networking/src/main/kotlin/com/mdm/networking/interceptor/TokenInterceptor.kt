@@ -19,7 +19,7 @@ class TokenInterceptor(
 
     override fun intercept(chain: Interceptor.Chain): Response {
         val req = chain.request()
-        if (isUnauthRoute(req)) return chain.proceed(req)
+        if (isUnauthRoute(req) || isPresignedDownload(req)) return chain.proceed(req)
 
         val token = runBlocking { auth.ensureAccessToken() }
         val newReq: Request = if (token.isNullOrEmpty()) req
@@ -32,4 +32,13 @@ class TokenInterceptor(
         return path == "/api/v1/enroll/" || path == "/api/v1/enroll"
             || path.endsWith("/api/v1/auth/refresh")
     }
+
+    // S3/MinIO presigned URLs already carry SigV4 authentication in the query
+    // string (X-Amz-Algorithm + X-Amz-Signature). If we also slap our own
+    // Authorization: Bearer header on the request, MinIO rejects it with
+    // 400 "request has multiple authentication types". Detect presigned
+    // requests by their tell-tale query param and let them through bare.
+    private fun isPresignedDownload(req: Request): Boolean =
+        req.url.queryParameter("X-Amz-Signature") != null
+            || req.url.queryParameter("X-Amz-Algorithm") != null
 }

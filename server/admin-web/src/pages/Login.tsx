@@ -4,8 +4,8 @@ import { login } from '../api/auth';
 import { useAuth } from '../stores/authStore';
 
 export function Login() {
-  const [email, setEmail] = useState('admin@mdm.local');
-  const [password, setPassword] = useState('ChangeMe!123');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [err, setErr] = useState('');
   const [busy, setBusy] = useState(false);
   const setTokens = useAuth(s => s.setTokens);

@@ -25,6 +25,7 @@ import (
 	"github.com/mdm/shared/config"
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
+	"github.com/mdm/shared/authz"
 	"github.com/mdm/shared/middleware"
 	"github.com/mdm/shared/mq"
 )
@@ -57,11 +58,14 @@ func main() {
 
 	devRepo := repository.NewDeviceRepo(pg)
 	tokRepo := repository.NewEnrollmentRepo(pg)
+	groupRepo := repository.NewGroupRepo(pg)
 	enrollSvc := service.NewEnrollmentService(devRepo, tokRepo, pg, issuer, bus, cfg.PublicBaseURL, cfg.JWTRefreshTTL)
 	deviceSvc := service.NewDeviceService(devRepo, bus)
+	groupSvc := service.NewGroupService(groupRepo, bus)
 
 	enrollH := handlers.NewEnrollmentHandler(enrollSvc)
 	deviceH := handlers.NewDeviceHandler(deviceSvc)
+	groupH := handlers.NewGroupHandler(groupSvc)
 
 	app := fiber.New(fiber.Config{
 		AppName:               "mdm-device",
@@ -80,11 +84,17 @@ func main() {
 
 	// Admin endpoints (user JWT).
 	admin := app.Group("/api/v1", middleware.JWTAuth(issuer), middleware.TenantScope())
-	admin.Post("/enroll/tokens", middleware.RequireRole("super_admin", "admin"), enrollH.CreateToken)
-	admin.Get("/devices", deviceH.List)
-	admin.Get("/devices/:id", deviceH.Get)
-	admin.Patch("/devices/:id", middleware.RequireRole("super_admin", "admin"), deviceH.Update)
-	admin.Delete("/devices/:id", middleware.RequireRole("super_admin", "admin"), deviceH.Retire)
+	admin.Post("/enroll/tokens", middleware.RequirePermission(authz.PermEnrollCreate), enrollH.CreateToken)
+	admin.Get("/devices", middleware.RequirePermission(authz.PermDeviceRead), deviceH.List)
+	admin.Get("/devices/:id", middleware.RequirePermission(authz.PermDeviceRead), deviceH.Get)
+	admin.Patch("/devices/:id", middleware.RequirePermission(authz.PermDeviceUpdate), deviceH.Update)
+	admin.Delete("/devices/:id", middleware.RequirePermission(authz.PermDeviceRetire), deviceH.Retire)
+
+	// Device groups (classification). Read for any role; mutations need group:manage.
+	admin.Get("/groups", middleware.RequirePermission(authz.PermGroupRead), groupH.List)
+	admin.Post("/groups", middleware.RequirePermission(authz.PermGroupManage), groupH.Create)
+	admin.Patch("/groups/:id", middleware.RequirePermission(authz.PermGroupManage), groupH.Update)
+	admin.Delete("/groups/:id", middleware.RequirePermission(authz.PermGroupManage), groupH.Delete)
 
 	// Device endpoints (device JWT).
 	dev := app.Group("/api/v1/devices/me", middleware.JWTAuth(issuer), middleware.RequireDevice())

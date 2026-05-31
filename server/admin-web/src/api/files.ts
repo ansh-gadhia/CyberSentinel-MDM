@@ -30,3 +30,7 @@ export async function presignDownload(id: string) {
   const r = await api.get<{ url: string; expires_in: number; sha256: string; size: number }>(`/api/v1/files/${id}/url`);
   return r.data;
 }
+
+export async function deleteFile(id: string) {
+  await api.delete(`/api/v1/files/${id}`);
+}

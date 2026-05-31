@@ -10,6 +10,8 @@ import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
@@ -17,6 +19,7 @@ import android.util.Size
 import androidx.core.content.ContextCompat
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -74,10 +77,23 @@ class CameraCapture @Inject constructor(
             ?: return CameraResult.Error("no stream config map")
         val size = pickJpegSize(map.getOutputSizes(ImageFormat.JPEG))
             ?: return CameraResult.Error("no JPEG sizes")
+        // Small preview-format reader purely to give the sensor a surface for
+        // a repeating preview request — needed so autofocus and auto-exposure
+        // converge before the still capture fires. Frames are drained and
+        // closed immediately; the bytes are not used.
+        val previewSize = pickPreviewSize(map.getOutputSizes(ImageFormat.YUV_420_888))
+            ?: Size(640, 480)
 
         val backThread = HandlerThread("mdm-cam").also { it.start() }
         val handler = Handler(backThread.looper)
         val reader = ImageReader.newInstance(size.width, size.height, ImageFormat.JPEG, 1)
+        val previewReader = ImageReader.newInstance(
+            previewSize.width, previewSize.height, ImageFormat.YUV_420_888, 2
+        )
+        previewReader.setOnImageAvailableListener({ r ->
+            // Just drain — we only need the frames so 3A can run.
+            runCatching { r.acquireLatestImage()?.close() }
+        }, handler)
 
         val imageDeferred = CompletableDeferred<ByteArray?>()
         reader.setOnImageAvailableListener({ r ->
@@ -96,24 +112,79 @@ class CameraCapture @Inject constructor(
             }
         }, handler)
 
+        var device: CameraDevice? = null
+        var session: CameraCaptureSession? = null
         try {
-            val device = openCamera(cameraId, handler)
-            val session = createSession(device, listOf(reader.surface), handler)
-            val req = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
-                addTarget(reader.surface)
+            device = openCamera(cameraId, handler)
+            session = createSession(device, listOf(previewReader.surface, reader.surface), handler)
+
+            // 1) Repeating preview — gives the sensor frames to warm up on. We
+            //    use CONTINUOUS_PICTURE so autofocus runs without us pumping
+            //    AF triggers; AE/AWB run on AUTO. This is the canonical pattern
+            //    for headless still capture on Camera2.
+            val previewReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(previewReader.surface)
                 set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
                 set(CaptureRequest.CONTROL_AE_MODE,
                     if (useFlash) CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
                     else CaptureRequest.CONTROL_AE_MODE_ON)
-                set(CaptureRequest.JPEG_QUALITY, 85.toByte())
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
             }.build()
-            session.capture(req, object : CameraCaptureSession.CaptureCallback() {}, handler)
+            session.setRepeatingRequest(previewReq, null, handler)
+
+            // 2) Trigger one-shot autofocus, then wait for AF_STATE to settle.
+            val afLockReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(previewReader.surface)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AF_TRIGGER, CaptureRequest.CONTROL_AF_TRIGGER_START)
+            }.build()
+            awaitState(session, afLockReq, handler, AF_TIMEOUT_MS) { r ->
+                val st = r.get(CaptureResult.CONTROL_AF_STATE) ?: return@awaitState true
+                st == CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED
+                    || st == CaptureResult.CONTROL_AF_STATE_NOT_FOCUSED_LOCKED
+                    || st == CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED
+                    || st == CaptureResult.CONTROL_AF_STATE_PASSIVE_UNFOCUSED
+            }
+
+            // 3) AE precapture — triggers metering for the actual still. Skip
+            //    if AE is already CONVERGED on the preview stream (typical when
+            //    lighting is steady).
+            val aePrecaptureReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+                addTarget(previewReader.surface)
+                set(CaptureRequest.CONTROL_AE_MODE,
+                    if (useFlash) CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                    else CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER,
+                    CaptureRequest.CONTROL_AE_PRECAPTURE_TRIGGER_START)
+            }.build()
+            awaitState(session, aePrecaptureReq, handler, AE_TIMEOUT_MS) { r ->
+                val st = r.get(CaptureResult.CONTROL_AE_STATE) ?: return@awaitState true
+                st == CaptureResult.CONTROL_AE_STATE_CONVERGED
+                    || st == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED
+                    || st == CaptureResult.CONTROL_AE_STATE_LOCKED
+            }
+
+            // 4) Stop the preview and fire the still. JPEG_ORIENTATION reads
+            //    the sensor orientation so the image lands rightside-up.
+            session.stopRepeating()
+            val sensorOrientation =
+                charac.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            val stillReq = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE).apply {
+                addTarget(reader.surface)
+                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+                set(CaptureRequest.CONTROL_AE_MODE,
+                    if (useFlash) CaptureRequest.CONTROL_AE_MODE_ON_ALWAYS_FLASH
+                    else CaptureRequest.CONTROL_AE_MODE_ON)
+                set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+                set(CaptureRequest.JPEG_QUALITY, 92.toByte())
+                set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
+            }.build()
+            session.capture(stillReq, object : CameraCaptureSession.CaptureCallback() {}, handler)
 
             val bytes = imageDeferred.await()
                 ?: return CameraResult.Error("image listener returned null")
-
-            session.close()
-            device.close()
             return CameraResult.Success(bytes, size.width, size.height)
         } catch (sec: SecurityException) {
             Timber.w(sec, "camera capture denied")
@@ -122,9 +193,39 @@ class CameraCapture @Inject constructor(
             Timber.e(t, "camera capture failed")
             return CameraResult.Error(t.message ?: t::class.java.simpleName)
         } finally {
+            runCatching { session?.close() }
+            runCatching { device?.close() }
             reader.close()
+            previewReader.close()
             backThread.quitSafely()
         }
+    }
+
+    /**
+     * Fires [trigger] on the session, then watches each TotalCaptureResult
+     * until [done] returns true (state converged) or the timeout fires. If
+     * the timeout fires we just continue — typical when the sensor is on a
+     * very stable surface and 3A is already converged but reports as
+     * INACTIVE. Better to capture something slightly off than to fail.
+     */
+    private suspend fun awaitState(
+        session: CameraCaptureSession,
+        trigger: CaptureRequest,
+        handler: Handler,
+        timeoutMs: Long,
+        done: (CaptureResult) -> Boolean
+    ) {
+        val gate = CompletableDeferred<Unit>()
+        val cb = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                s: CameraCaptureSession, r: CaptureRequest, res: TotalCaptureResult
+            ) {
+                if (!gate.isCompleted && done(res)) gate.complete(Unit)
+            }
+        }
+        session.capture(trigger, cb, handler)
+        withTimeoutOrNull(timeoutMs) { gate.await() }
+            ?: Timber.w("3A state did not converge within ${timeoutMs}ms — proceeding anyway")
     }
 
     fun setTorch(on: Boolean): Boolean {
@@ -160,6 +261,15 @@ class CameraCapture @Inject constructor(
             ?: sizes.minByOrNull { it.width.toLong() * it.height }
     }
 
+    /** Smallest preview size ≥ 640×480 — preview is just a 3A heartbeat, not output. */
+    private fun pickPreviewSize(sizes: Array<Size>?): Size? {
+        if (sizes == null || sizes.isEmpty()) return null
+        return sizes
+            .filter { it.width >= 640 && it.width <= 1280 }
+            .minByOrNull { it.width.toLong() * it.height }
+            ?: sizes.minByOrNull { it.width.toLong() * it.height }
+    }
+
     @SuppressLint("MissingPermission")
     private suspend fun openCamera(id: String, h: Handler): CameraDevice =
         suspendCoroutine { cont ->
@@ -175,6 +285,12 @@ class CameraCapture @Inject constructor(
                 }
             }, h)
         }
+
+    private companion object {
+        // Generous on cheap phones — the back camera AF motor can be slow.
+        const val AF_TIMEOUT_MS = 2500L
+        const val AE_TIMEOUT_MS = 1500L
+    }
 
     private suspend fun createSession(
         device: CameraDevice, outputs: List<android.view.Surface>, h: Handler

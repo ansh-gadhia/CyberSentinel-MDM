@@ -66,6 +66,21 @@ func (r *FileRepo) List(ctx context.Context, f ListFilter) ([]models.FileObject,
 	return out, err
 }
 
+// ListAudioSegments returns a recording session's audio segments in play order.
+// Segments are named audio_<session>_<zero-padded-seq>_<ts>.aac, so ordering by
+// name is sequence order. Scoped to the tenant.
+func (r *FileRepo) ListAudioSegments(ctx context.Context, tenantID uuid.UUID, session string) ([]models.FileObject, error) {
+	const q = `SELECT * FROM file_objects
+	            WHERE tenant_id = $1 AND kind = 'audio' AND deleted_at IS NULL
+	              AND name LIKE $2
+	            ORDER BY name ASC`
+	out := []models.FileObject{}
+	// LIKE pattern: audio_<session>_%  (underscores in the literal are fine —
+	// session ids don't contain LIKE wildcards we care about here).
+	err := r.db.SelectContext(ctx, &out, q, tenantID, "audio_"+session+"_%")
+	return out, err
+}
+
 func (r *FileRepo) SoftDelete(ctx context.Context, tenantID, id uuid.UUID) error {
 	_, err := r.db.ExecContext(ctx,
 		`UPDATE file_objects SET deleted_at = now() WHERE tenant_id = $1 AND id = $2`,

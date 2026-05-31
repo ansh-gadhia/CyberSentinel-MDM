@@ -9,6 +9,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/mdm/command-service/internal/service"
+	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 	apperr "github.com/mdm/shared/errors"
 	"github.com/mdm/shared/middleware"
 )
@@ -34,6 +36,13 @@ func (h *CommandHandler) Create(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid device_id"})
 	}
+	// Per-command-kind authorization: destructive (WIPE/RESET/…) and
+	// surveillance (CAPTURE_PHOTO/START_AUDIO_STREAM) commands require strictly
+	// more than the basic help-desk tier an operator holds. Enforced here (not
+	// just the route's baseline gate) so the risk tier travels with the kind.
+	if !authz.Can(roleOf(c), authz.CommandPermission(req.Kind)) {
+		return c.Status(403).JSON(fiber.Map{"error": "your role may not issue command " + req.Kind})
+	}
 	timeout := time.Duration(req.TimeoutSec) * time.Second
 	cmd, err := h.svc.Create(c.Context(), service.CreateInput{
 		TenantID:    tenantOf(c),
@@ -48,6 +57,40 @@ func (h *CommandHandler) Create(c *fiber.Ctx) error {
 		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.Status(201).JSON(cmd)
+}
+
+type broadcastReq struct {
+	GroupID string          `json:"group_id"`
+	Kind    string          `json:"kind"`
+	Payload json.RawMessage `json:"payload,omitempty"`
+}
+
+// Broadcast fans a command out to every device in a group. The per-command-kind
+// risk tier is enforced here (same as Create) so, e.g., an operator can message
+// a group but not WIPE one.
+func (h *CommandHandler) Broadcast(c *fiber.Ctx) error {
+	var req broadcastReq
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "malformed"})
+	}
+	gid, err := uuid.Parse(req.GroupID)
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid group_id"})
+	}
+	if !authz.Can(roleOf(c), authz.CommandPermission(req.Kind)) {
+		return c.Status(403).JSON(fiber.Map{"error": "your role may not issue command " + req.Kind})
+	}
+	n, err := h.svc.Broadcast(c.Context(), service.BroadcastInput{
+		TenantID:  tenantOf(c),
+		CreatedBy: userOf(c),
+		GroupID:   gid,
+		Kind:      req.Kind,
+		Payload:   req.Payload,
+	})
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.Status(201).JSON(fiber.Map{"dispatched": n})
 }
 
 func (h *CommandHandler) Get(c *fiber.Ctx) error {
@@ -125,4 +168,11 @@ func userOf(c *fiber.Ctx) uuid.UUID {
 	s, _ := c.Locals(middleware.CtxUserID).(string)
 	t, _ := uuid.Parse(s)
 	return t
+}
+func roleOf(c *fiber.Ctx) string {
+	claims, _ := c.Locals(middleware.CtxClaims).(*auth.Claims)
+	if claims == nil {
+		return ""
+	}
+	return claims.Role
 }

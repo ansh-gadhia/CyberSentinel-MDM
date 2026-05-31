@@ -1,10 +1,14 @@
 import { api } from './client';
 
+export interface AuthUserDTO {
+  id: string; email: string; role: string; tenant_id: string; permissions?: string[];
+}
+
 export interface LoginResponse {
   access_token: string;
   refresh_token: string;
   expires_in: number;
-  user: { id: string; email: string; role: string; tenant_id: string };
+  user: AuthUserDTO;
 }
 
 export async function login(email: string, password: string): Promise<LoginResponse> {
@@ -14,9 +18,56 @@ export async function login(email: string, password: string): Promise<LoginRespo
 
 export async function me() {
   const r = await api.get('/api/v1/auth/me');
-  return r.data as { id: string; email: string; role: string; tenant_id: string };
+  return r.data as AuthUserDTO;
+}
+
+// ---- RBAC: roles matrix + user management (super_admin) ----
+
+export interface RolesMatrix {
+  roles: string[];
+  permissions: string[];
+  matrix: Record<string, string[]>;
+}
+
+export async function getRoles(): Promise<RolesMatrix> {
+  const r = await api.get<RolesMatrix>('/api/v1/auth/roles');
+  return r.data;
+}
+
+export async function createUser(email: string, password: string, role: string): Promise<TenantUser> {
+  const r = await api.post<TenantUser>('/api/v1/auth/users', { email, password, role });
+  return r.data;
+}
+
+export async function updateUserRole(id: string, role: string) {
+  await api.patch(`/api/v1/auth/users/${id}/role`, { role });
+}
+
+export async function deactivateUser(id: string) {
+  await api.post(`/api/v1/auth/users/${id}/deactivate`, {});
 }
 
 export async function logoutServer(refresh_token: string) {
   await api.post('/api/v1/auth/logout', { refresh_token });
+}
+
+export interface TenantUser { id: string; email: string; role: string; tenant_id: string }
+
+// listUsers returns the tenant's admin users so the audit log can resolve an
+// actor UUID to an email. super_admin/admin only on the server.
+export async function listUsers(): Promise<TenantUser[]> {
+  const r = await api.get<{ items: TenantUser[] }>('/api/v1/auth/users');
+  return r.data.items;
+}
+
+// changePassword updates the logged-in user's own password (server verifies the
+// current one). 204 on success.
+export async function changePassword(old_password: string, new_password: string) {
+  await api.post('/api/v1/auth/change-password', { old_password, new_password });
+}
+
+// updateEmail changes the logged-in user's own email; returns the updated user.
+export async function updateEmail(email: string): Promise<TenantUser> {
+  const r = await api.patch<TenantUser>('/api/v1/auth/me', { email });
+  return r.data;
 }

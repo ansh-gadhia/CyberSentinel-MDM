@@ -6,6 +6,7 @@ interface AuthUser {
   email: string;
   role: string;
   tenant_id: string;
+  permissions?: string[];
 }
 
 interface AuthState {

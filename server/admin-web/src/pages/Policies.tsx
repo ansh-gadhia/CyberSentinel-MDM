@@ -2,9 +2,31 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   assignPolicy, deletePolicy, listAssignmentsFor, listPolicies, savePolicy, type Policy
 } from '../api/policies';
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 
-const TEMPLATES: Array<{ label: string; spec: object }> = [
+// The Android agent (PolicySpec.kt) decodes with ignoreUnknownKeys=true, so any
+// field placed at the wrong nesting level is silently dropped. We learned this
+// the hard way: a hand-written policy with top-level url_blocklist looked like
+// it saved fine, but the device never blocked anything because the agent's
+// AppPolicy expects apps.url_blocklist. The structured editor below builds the
+// JSON in the canonical shape so users can't put things in the wrong place.
+
+const RESTRICTIONS: Array<{ key: string; label: string; hint?: string }> = [
+  { key: 'disable_camera', label: 'Disable camera' },
+  { key: 'disable_screen_capture', label: 'Disable screen capture' },
+  { key: 'disable_usb_file_transfer', label: 'Disable USB file transfer' },
+  { key: 'disable_bluetooth', label: 'Disable Bluetooth' },
+  { key: 'disable_nfc', label: 'Disable NFC' },
+  { key: 'disable_hotspot', label: 'Disable Wi-Fi hotspot' },
+  { key: 'disable_location', label: 'Disable location' },
+  { key: 'disable_unknown_sources', label: 'Block installs from unknown sources' },
+  { key: 'disable_accessibility', label: 'Disable accessibility services' },
+  { key: 'disable_factory_reset', label: 'Block factory reset' },
+  { key: 'disable_safe_boot', label: 'Block safe boot' },
+  { key: 'disable_add_user', label: 'Block adding users' }
+];
+
+const TEMPLATES: Array<{ label: string; spec: Record<string, unknown> }> = [
   {
     label: 'Disable camera + 4-digit PIN',
     spec: {
@@ -31,10 +53,7 @@ const TEMPLATES: Array<{ label: string; spec: object }> = [
           'com.google.android.apps.youtube.music'
         ],
         url_blocklist: [
-          'youtube.com',
-          '*.youtube.com',
-          'youtu.be',
-          '*.googlevideo.com'
+          'youtube.com', '*.youtube.com', 'youtu.be', '*.googlevideo.com'
         ]
       }
     }
@@ -44,11 +63,8 @@ const TEMPLATES: Array<{ label: string; spec: object }> = [
     spec: {
       apps: {
         blocklist: [
-          'com.instagram.android',
-          'com.facebook.katana',
-          'com.facebook.lite',
-          'com.twitter.android',
-          'com.zhiliaoapp.musically'
+          'com.instagram.android', 'com.facebook.katana', 'com.facebook.lite',
+          'com.twitter.android', 'com.zhiliaoapp.musically'
         ],
         url_blocklist: [
           '*.instagram.com', 'instagram.com',
@@ -59,33 +75,120 @@ const TEMPLATES: Array<{ label: string; spec: object }> = [
       }
     }
   },
-  {
-    label: 'Capture front photo on every unlock',
-    spec: {
-      security: { capture_on_unlock: true }
-    }
-  },
+  { label: 'Capture front photo on every unlock', spec: { security: { capture_on_unlock: true } } },
   {
     label: 'Compliance baseline',
-    spec: {
-      compliance: { require_encryption: true, block_rooted: true }
-    }
+    spec: { compliance: { require_encryption: true, block_rooted: true } }
   }
 ];
+
+interface FormState {
+  restrictions: Record<string, boolean>;
+  appBlocklist: string;           // one package per line
+  urlBlocklist: string;           // one pattern per line
+  captureOnUnlock: boolean;
+  advancedJson: string;           // any fields the form doesn't cover
+}
+
+// Decompose a spec into form fields, peeling off whatever the structured UI
+// represents and leaving the rest as advanced JSON. Round-trips losslessly:
+// build(decompose(s)) ≅ s for any valid s.
+function decompose(spec: Record<string, unknown>): FormState {
+  const s: any = { ...spec };
+  const restrictionsObj = (s.restrictions ?? {}) as Record<string, boolean>;
+  const restrictions: Record<string, boolean> = {};
+  for (const r of RESTRICTIONS) {
+    if (restrictionsObj[r.key] === true) restrictions[r.key] = true;
+  }
+  delete s.restrictions;
+
+  const apps: any = { ...(s.apps ?? {}) };
+  const appBlocklist = Array.isArray(apps.blocklist) ? (apps.blocklist as string[]).join('\n') : '';
+  const urlBlocklist = Array.isArray(apps.url_blocklist) ? (apps.url_blocklist as string[]).join('\n') : '';
+  delete apps.blocklist;
+  delete apps.url_blocklist;
+  if (Object.keys(apps).length > 0) s.apps = apps; else delete s.apps;
+
+  const security: any = { ...(s.security ?? {}) };
+  const captureOnUnlock = security.capture_on_unlock === true;
+  delete security.capture_on_unlock;
+  if (Object.keys(security).length > 0) s.security = security; else delete s.security;
+
+  return {
+    restrictions,
+    appBlocklist,
+    urlBlocklist,
+    captureOnUnlock,
+    advancedJson: JSON.stringify(s, null, 2)
+  };
+}
+
+function build(form: FormState): { ok: true; spec: Record<string, unknown> } | { ok: false; err: string } {
+  let extras: Record<string, unknown> = {};
+  const adv = form.advancedJson.trim();
+  if (adv && adv !== '{}') {
+    try {
+      const parsed = JSON.parse(adv);
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        return { ok: false, err: 'Advanced JSON must be a JSON object.' };
+      }
+      extras = parsed;
+    } catch (e: any) {
+      return { ok: false, err: `Advanced JSON is invalid: ${e?.message ?? e}` };
+    }
+  }
+  // Top-level legacy fields people sometimes hand-write — auto-nest them so
+  // the agent actually sees them.
+  if (Array.isArray((extras as any).url_blocklist) || Array.isArray((extras as any).blocklist)) {
+    const a: any = { ...((extras as any).apps ?? {}) };
+    if ((extras as any).url_blocklist) { a.url_blocklist = (extras as any).url_blocklist; delete (extras as any).url_blocklist; }
+    if ((extras as any).blocklist) { a.blocklist = (extras as any).blocklist; delete (extras as any).blocklist; }
+    (extras as any).apps = a;
+  }
+
+  const spec: Record<string, unknown> = { ...extras };
+
+  const enabledRestrictions = Object.entries(form.restrictions)
+    .filter(([, v]) => v).reduce((acc, [k]) => { acc[k] = true; return acc; }, {} as Record<string, boolean>);
+  if (Object.keys(enabledRestrictions).length > 0) {
+    spec.restrictions = { ...(spec.restrictions as object ?? {}), ...enabledRestrictions };
+  }
+
+  const apps: any = { ...((spec.apps as object) ?? {}) };
+  const appList = form.appBlocklist.split('\n').map(s => s.trim()).filter(Boolean);
+  const urlList = form.urlBlocklist.split('\n').map(s => s.trim()).filter(Boolean);
+  if (appList.length) apps.blocklist = appList;
+  if (urlList.length) apps.url_blocklist = urlList;
+  if (Object.keys(apps).length > 0) spec.apps = apps;
+
+  if (form.captureOnUnlock) {
+    spec.security = { ...((spec.security as object) ?? {}), capture_on_unlock: true };
+  }
+
+  return { ok: true, spec };
+}
 
 export function Policies() {
   const qc = useQueryClient();
   const { data, isLoading } = useQuery({ queryKey: ['policies'], queryFn: listPolicies });
-  const [editor, setEditor] = useState<{ id?: string; name: string; spec: string } | null>(null);
+  const [editor, setEditor] = useState<{ id?: string; name: string; form: FormState } | null>(null);
   const [view, setView] = useState<Policy | null>(null);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
 
   const save = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       if (!editor) throw new Error('no editor');
-      const spec = JSON.parse(editor.spec);
-      return savePolicy({ id: editor.id, name: editor.name, spec });
+      if (!editor.name.trim()) throw new Error('Policy name is required.');
+      const built = build(editor.form);
+      if (!built.ok) throw new Error(built.err);
+      return savePolicy({ id: editor.id, name: editor.name.trim(), spec: built.spec });
     },
-    onSuccess: () => { qc.invalidateQueries({ queryKey: ['policies'] }); setEditor(null); }
+    onMutate: () => setSaveErr(null),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['policies'] }); setEditor(null); },
+    onError: (e: any) => {
+      const msg = e?.response?.data?.error ?? e?.message ?? String(e);
+      setSaveErr(msg);
+    }
   });
   const remove = useMutation({
     mutationFn: (id: string) => deletePolicy(id),
@@ -96,6 +199,11 @@ export function Policies() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['policies'] })
   });
 
+  function openNew(name = '', spec: Record<string, unknown> = {}) {
+    setSaveErr(null);
+    setEditor({ name, form: decompose(spec) });
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-2">
@@ -104,7 +212,7 @@ export function Policies() {
           <select
             onChange={e => {
               const t = TEMPLATES[+e.target.value];
-              if (t) setEditor({ name: t.label, spec: JSON.stringify(t.spec, null, 2) });
+              if (t) openNew(t.label, t.spec);
               e.currentTarget.value = '';
             }}
             className="rounded border px-2 py-1.5 bg-transparent text-sm">
@@ -112,7 +220,7 @@ export function Policies() {
             {TEMPLATES.map((t, i) => <option key={t.label} value={i}>{t.label}</option>)}
           </select>
           <button
-            onClick={() => setEditor({ name: '', spec: '{\n  "restrictions": { "disable_camera": false }\n}' })}
+            onClick={() => openNew()}
             className="bg-brand-600 hover:bg-brand-700 text-white text-sm px-3 py-1.5 rounded">
             + New
           </button>
@@ -120,20 +228,14 @@ export function Policies() {
       </div>
 
       {editor && (
-        <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-2">
-          <input value={editor.name} onChange={e => setEditor({ ...editor, name: e.target.value })}
-                 placeholder="Policy name"
-                 className="block w-full rounded border px-3 py-2 bg-transparent" />
-          <textarea value={editor.spec} onChange={e => setEditor({ ...editor, spec: e.target.value })}
-                    className="block w-full h-64 rounded border px-3 py-2 font-mono text-xs bg-transparent" />
-          <div className="flex justify-end gap-2">
-            <button onClick={() => setEditor(null)} className="px-3 py-1.5 text-sm">Cancel</button>
-            <button onClick={() => save.mutate()}
-                    className="bg-brand-600 hover:bg-brand-700 text-white text-sm px-3 py-1.5 rounded">
-              {editor.id ? 'Save new version' : 'Save'}
-            </button>
-          </div>
-        </div>
+        <PolicyEditor
+          editor={editor}
+          setEditor={setEditor}
+          saving={save.isPending}
+          saveErr={saveErr}
+          onCancel={() => { setEditor(null); setSaveErr(null); }}
+          onSave={() => save.mutate()}
+        />
       )}
 
       <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-hidden">
@@ -160,7 +262,7 @@ export function Policies() {
                   <div className="inline-flex gap-2">
                     <button onClick={() => setView(p)}
                             className="text-xs px-2 py-1 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">View</button>
-                    <button onClick={() => setEditor({ id: p.id, name: p.name, spec: JSON.stringify(p.spec, null, 2) })}
+                    <button onClick={() => { setSaveErr(null); setEditor({ id: p.id, name: p.name, form: decompose(p.spec) }); }}
                             className="text-xs px-2 py-1 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">Edit</button>
                     <button onClick={() => { if (confirm(`Assign "${p.name}" to ALL devices in your tenant?`)) assignTenant.mutate(p.id); }}
                             className="text-xs px-2 py-1 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">Assign to tenant</button>
@@ -175,6 +277,108 @@ export function Policies() {
       </div>
 
       {view && <PolicyViewer p={view} onClose={() => setView(null)} />}
+    </div>
+  );
+}
+
+function PolicyEditor({
+  editor, setEditor, saving, saveErr, onCancel, onSave
+}: {
+  editor: { id?: string; name: string; form: FormState };
+  setEditor: (e: { id?: string; name: string; form: FormState }) => void;
+  saving: boolean;
+  saveErr: string | null;
+  onCancel: () => void;
+  onSave: () => void;
+}) {
+  const [showAdvanced, setShowAdvanced] = useState(editor.form.advancedJson.trim() !== '{}');
+  const setForm = (patch: Partial<FormState>) =>
+    setEditor({ ...editor, form: { ...editor.form, ...patch } });
+
+  const previewSpec = useMemo(() => {
+    const built = build(editor.form);
+    return built.ok ? JSON.stringify(built.spec, null, 2) : `// ${built.err}`;
+  }, [editor.form]);
+
+  return (
+    <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4 space-y-4">
+      <div>
+        <label className="block text-xs uppercase tracking-wide text-slate-500 mb-1">Policy name</label>
+        <input value={editor.name} onChange={e => setEditor({ ...editor, name: e.target.value })}
+               placeholder="e.g. Block social media"
+               className="block w-full rounded border px-3 py-2 bg-transparent" />
+      </div>
+
+      <div>
+        <div className="text-xs uppercase tracking-wide text-slate-500 mb-2">Restrictions</div>
+        <div className="grid grid-cols-2 md:grid-cols-3 gap-x-4 gap-y-1.5 text-sm">
+          {RESTRICTIONS.map(r => (
+            <label key={r.key} className="inline-flex items-center gap-2 cursor-pointer">
+              <input type="checkbox"
+                     checked={!!editor.form.restrictions[r.key]}
+                     onChange={e => setForm({ restrictions: { ...editor.form.restrictions, [r.key]: e.target.checked } })} />
+              <span>{r.label}</span>
+            </label>
+          ))}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div>
+          <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">App blocklist</div>
+          <div className="text-xs text-slate-500 mb-1">One Android package name per line. E.g. <code>com.instagram.android</code>.</div>
+          <textarea value={editor.form.appBlocklist} onChange={e => setForm({ appBlocklist: e.target.value })}
+                    placeholder="com.example.app"
+                    className="block w-full h-32 rounded border px-3 py-2 font-mono text-xs bg-transparent" />
+        </div>
+        <div>
+          <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">URL blocklist (Chrome / Edge / Brave)</div>
+          <div className="text-xs text-slate-500 mb-1">One pattern per line. E.g. <code>youtube.com</code>, <code>*.youtube.com</code>, <code>*://*.tiktok.com/*</code>.</div>
+          <textarea value={editor.form.urlBlocklist} onChange={e => setForm({ urlBlocklist: e.target.value })}
+                    placeholder="example.com"
+                    className="block w-full h-32 rounded border px-3 py-2 font-mono text-xs bg-transparent" />
+        </div>
+      </div>
+
+      <div>
+        <label className="inline-flex items-center gap-2 cursor-pointer text-sm">
+          <input type="checkbox"
+                 checked={editor.form.captureOnUnlock}
+                 onChange={e => setForm({ captureOnUnlock: e.target.checked })} />
+          <span>Capture front-camera photo on every unlock</span>
+        </label>
+      </div>
+
+      <div>
+        <button onClick={() => setShowAdvanced(v => !v)}
+                className="text-xs text-slate-500 underline">
+          {showAdvanced ? 'Hide' : 'Show'} advanced JSON (password, network, compliance, etc.)
+        </button>
+        {showAdvanced && (
+          <textarea value={editor.form.advancedJson} onChange={e => setForm({ advancedJson: e.target.value })}
+                    placeholder='{"password": {"complexity": 65536}}'
+                    className="block w-full h-32 mt-2 rounded border px-3 py-2 font-mono text-xs bg-transparent" />
+        )}
+      </div>
+
+      <div>
+        <div className="text-xs uppercase tracking-wide text-slate-500 mb-1">Effective JSON sent to device</div>
+        <pre className="text-xs bg-slate-50 dark:bg-slate-950 rounded p-3 overflow-auto max-h-40">{previewSpec}</pre>
+      </div>
+
+      {saveErr && (
+        <div className="rounded border border-rose-300 bg-rose-50 dark:bg-rose-950/40 px-3 py-2 text-sm text-rose-700 dark:text-rose-300">
+          {saveErr}
+        </div>
+      )}
+
+      <div className="flex justify-end gap-2">
+        <button onClick={onCancel} className="px-3 py-1.5 text-sm">Cancel</button>
+        <button onClick={onSave} disabled={saving}
+                className="bg-brand-600 hover:bg-brand-700 disabled:opacity-60 text-white text-sm px-3 py-1.5 rounded">
+          {saving ? 'Saving…' : (editor.id ? 'Save new version' : 'Save')}
+        </button>
+      </div>
     </div>
   );
 }

@@ -23,7 +23,9 @@ import (
 	"github.com/mdm/shared/config"
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
+	"github.com/mdm/shared/authz"
 	"github.com/mdm/shared/middleware"
+	"github.com/mdm/shared/mq"
 )
 
 func main() {
@@ -47,7 +49,14 @@ func main() {
 
 	issuer := auth.NewIssuer(cfg.JWTSecret, cfg.JWTAccessTTL)
 
-	app := newApp(cfg.ServiceName, pg, rdb, issuer, cfg.JWTRefreshTTL)
+	// Best-effort NATS for audit emission (user/role management). A nil bus is
+	// tolerated by events.Emit, so auth still works if NATS is down.
+	bus, err := mq.Connect(cfg.NATSUrl)
+	if err != nil {
+		log.Warn().Err(err).Msg("nats connect — user-management audit events will be dropped")
+	}
+
+	app := newApp(cfg.ServiceName, pg, rdb, issuer, cfg.JWTRefreshTTL, bus)
 
 	// Prometheus on a separate port to keep it off the public path.
 	go func() {
@@ -72,7 +81,7 @@ func main() {
 	_ = app.ShutdownWithContext(shutdownCtx)
 }
 
-func newApp(svc string, pg *sqlx.DB, rdb interface{}, issuer *auth.Issuer, refreshTTL time.Duration) *fiber.App {
+func newApp(svc string, pg *sqlx.DB, rdb interface{}, issuer *auth.Issuer, refreshTTL time.Duration, bus *mq.Bus) *fiber.App {
 	app := fiber.New(fiber.Config{
 		AppName:               "mdm-auth",
 		DisableStartupMessage: true,
@@ -87,7 +96,7 @@ func newApp(svc string, pg *sqlx.DB, rdb interface{}, issuer *auth.Issuer, refre
 	userRepo := repository.NewUserRepo(pg)
 	refreshRepo := repository.NewRefreshRepo(pg)
 
-	authSvc := service.NewAuthService(userRepo, refreshRepo, issuer, refreshTTL)
+	authSvc := service.NewAuthService(userRepo, refreshRepo, issuer, refreshTTL, bus)
 	authH := handlers.NewAuthHandler(authSvc)
 
 	app.Get("/healthz", func(c *fiber.Ctx) error { return c.SendString("ok") })
@@ -103,6 +112,13 @@ func newApp(svc string, pg *sqlx.DB, rdb interface{}, issuer *auth.Issuer, refre
 	v1.Post("/refresh", authH.Refresh)
 	v1.Post("/logout", authH.Logout)
 	v1.Get("/me", middleware.JWTAuth(issuer), authH.Me)
+	v1.Patch("/me", middleware.JWTAuth(issuer), authH.UpdateProfile)
+	v1.Post("/change-password", middleware.JWTAuth(issuer), authH.ChangePassword)
+	v1.Get("/roles", middleware.JWTAuth(issuer), middleware.RequirePermission(authz.PermRoleRead), authH.Roles)
+	v1.Get("/users", middleware.JWTAuth(issuer), middleware.RequirePermission(authz.PermUserRead), authH.Users)
+	v1.Post("/users", middleware.JWTAuth(issuer), middleware.RequirePermission(authz.PermUserManage), authH.CreateUser)
+	v1.Patch("/users/:id/role", middleware.JWTAuth(issuer), middleware.RequirePermission(authz.PermUserManage), authH.UpdateUserRole)
+	v1.Post("/users/:id/deactivate", middleware.JWTAuth(issuer), middleware.RequirePermission(authz.PermUserManage), authH.DeactivateUser)
 
 	return app
 }

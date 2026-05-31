@@ -13,6 +13,7 @@ import (
 	"github.com/rs/zerolog/log"
 
 	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 	"github.com/mdm/shared/config"
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
@@ -62,10 +63,10 @@ func main() {
 		middleware.JWTAuth(issuer), middleware.RequireDevice(), middleware.TenantScope(),
 		h.Ingest)
 	app.Get("/api/v1/telemetry/devices/:deviceID/latest",
-		middleware.JWTAuth(issuer), middleware.TenantScope(),
+		middleware.JWTAuth(issuer), middleware.TenantScope(), middleware.RequirePermission(authz.PermTelemetryRead),
 		h.Latest)
 	app.Get("/api/v1/telemetry/devices/:deviceID/events",
-		middleware.JWTAuth(issuer), middleware.TenantScope(),
+		middleware.JWTAuth(issuer), middleware.TenantScope(), middleware.RequirePermission(authz.PermTelemetryRead),
 		h.Events)
 
 	go func() {

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { listFiles, uploadFile, type FileObject } from '../api/files';
+import { deleteFile, listFiles, uploadFile, type FileObject } from '../api/files';
 import { listDevices, issueCommand } from '../api/devices';
 
 export function Apps() {
@@ -17,6 +17,12 @@ export function Apps() {
     mutationFn: (f: File) => uploadFile(f, 'apk'),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['files', 'apk'] }),
     onSettled: () => setBusy(false)
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => deleteFile(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['files', 'apk'] }),
+    onError: (e: any) => alert(`Delete failed: ${e?.response?.data?.error ?? e?.message ?? 'unknown'}`)
   });
 
   return (
@@ -56,10 +62,20 @@ export function Apps() {
                 <td className="px-4 py-2 text-xs text-slate-500">{formatSize(f.size_bytes)}</td>
                 <td className="px-4 py-2 font-mono text-[11px] text-slate-500" title={f.sha256}>{f.sha256.slice(0, 16)}…</td>
                 <td className="px-4 py-2 text-xs text-slate-500">{new Date(f.created_at).toLocaleString()}</td>
-                <td className="px-4 py-2 text-right">
+                <td className="px-4 py-2 text-right space-x-2 whitespace-nowrap">
                   <button onClick={() => setInstallFor(f)}
                           className="text-xs px-2 py-1 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">
                     Install to device…
+                  </button>
+                  <button
+                    disabled={remove.isPending && remove.variables === f.id}
+                    onClick={() => {
+                      if (confirm(`Delete "${f.name}"? Already-installed copies on devices are unaffected.`)) {
+                        remove.mutate(f.id);
+                      }
+                    }}
+                    className="text-xs px-2 py-1 rounded border border-red-300 text-red-600 hover:bg-red-50 dark:hover:bg-red-900/30 disabled:opacity-40">
+                    {remove.isPending && remove.variables === f.id ? 'Deleting…' : 'Delete'}
                   </button>
                 </td>
               </tr>

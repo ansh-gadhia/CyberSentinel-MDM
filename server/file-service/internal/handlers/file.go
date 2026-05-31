@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/gofiber/fiber/v2"
@@ -101,6 +103,69 @@ func (h *Handler) upload(c *fiber.Ctx, byDevice bool) error {
 	return c.Status(201).JSON(obj)
 }
 
+// SessionAudio stitches a recording session's segments into a single
+// continuous .aac and returns a presigned URL to it. Segments are AAC/ADTS,
+// which concatenate by simple byte-append (no transcoder needed), so the admin
+// UI can play a whole session as one scrubbable track instead of N clips. The
+// stitched object is cached and only rebuilt when a newer segment appears.
+func (h *Handler) SessionAudio(c *fiber.Ctx) error {
+	session := c.Params("sessionID")
+	if session == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "missing session"})
+	}
+	tenantID := tenantOf(c)
+	segs, err := h.repo.ListAudioSegments(c.Context(), tenantID, session)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	if len(segs) == 0 {
+		return c.Status(404).JSON(fiber.Map{"error": "no audio for session"})
+	}
+	// Only ADTS/AAC segments byte-concatenate cleanly. Legacy MP4 (.m4a)
+	// sessions can't be stitched without a transcoder — signal the UI to fall
+	// back to its sequential player.
+	for _, s := range segs {
+		if !strings.HasSuffix(strings.ToLower(s.Name), ".aac") {
+			return c.Status(422).JSON(fiber.Map{"error": "session not stitchable (legacy format)"})
+		}
+	}
+
+	stitchedKey := stitchedSessionKey(tenantID, session)
+
+	// Cache: only rebuild if a segment is newer than the stitched file.
+	var newest time.Time
+	for _, s := range segs {
+		if s.CreatedAt.After(newest) {
+			newest = s.CreatedAt
+		}
+	}
+	lm, exists, _ := h.store.Stat(c.Context(), stitchedKey)
+	if !exists || !lm.After(newest) {
+		var buf bytes.Buffer
+		for _, s := range segs {
+			rc, err := h.store.Get(c.Context(), s.StorageKey)
+			if err != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "read segment: " + err.Error()})
+			}
+			_, cErr := io.Copy(&buf, rc)
+			rc.Close()
+			if cErr != nil {
+				return c.Status(500).JSON(fiber.Map{"error": "concat: " + cErr.Error()})
+			}
+		}
+		if err := h.store.Put(c.Context(), stitchedKey, bytes.NewReader(buf.Bytes()), int64(buf.Len()), "audio/aac"); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": "store stitched: " + err.Error()})
+		}
+		log.Info().Str("session", session).Int("segments", len(segs)).Int("bytes", buf.Len()).Msg("stitched audio session")
+	}
+
+	url, err := h.store.PresignDownloadFor(c.Context(), stitchedKey, time.Hour, publicEndpointFromRequest(c))
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(fiber.Map{"url": url, "expires_in": 3600, "segments": len(segs)})
+}
+
 func (h *Handler) List(c *fiber.Ctx) error {
 	filt := repository.ListFilter{TenantID: tenantOf(c), Kind: c.Query("kind")}
 	if s := c.Query("device_id"); s != "" {
@@ -135,11 +200,16 @@ func (h *Handler) Presign(c *fiber.Ctx) error {
 		return c.Status(404).JSON(fiber.Map{"error": "not found"})
 	}
 	pubEndpoint := publicEndpointFromRequest(c)
-	url, err := h.store.PresignDownloadFor(c.Context(), obj.StorageKey, 10*time.Minute, pubEndpoint)
+	// 1 hour TTL. A large APK on a slow mobile link can easily blow past the
+	// old 10-min budget — by the time the agent finishes streaming, MinIO has
+	// already started rejecting range requests with 403 "Request has expired",
+	// which the agent then reports as the misleading "empty body" error.
+	const ttl = time.Hour
+	url, err := h.store.PresignDownloadFor(c.Context(), obj.StorageKey, ttl, pubEndpoint)
 	if err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
-	return c.JSON(fiber.Map{"url": url, "expires_in": 600, "sha256": obj.SHA256, "size": obj.SizeBytes})
+	return c.JSON(fiber.Map{"url": url, "expires_in": int(ttl.Seconds()), "sha256": obj.SHA256, "size": obj.SizeBytes})
 }
 
 // publicEndpointFromRequest returns "scheme://host[:port]" the admin's
@@ -165,10 +235,62 @@ func (h *Handler) Delete(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
 	}
-	if err := h.repo.SoftDelete(c.Context(), tenantOf(c), id); err != nil {
+	tenantID := tenantOf(c)
+	// Read before deleting so we can invalidate the stitched-session cache if
+	// this is an audio segment — otherwise the cached stitch keeps serving the
+	// deleted segment's audio (it's newer than the remaining segments, so the
+	// freshness check wouldn't rebuild it).
+	obj, _ := h.repo.Get(c.Context(), tenantID, id)
+	if err := h.repo.SoftDelete(c.Context(), tenantID, id); err != nil {
 		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
 	}
+	if obj != nil && obj.Kind == "audio" {
+		if sess := audioSessionFromName(obj.Name); sess != "" {
+			_ = h.store.Delete(c.Context(), stitchedSessionKey(tenantID, sess))
+		}
+	}
 	return c.SendStatus(204)
+}
+
+// DeleteSession removes an entire recording session: every audio segment plus
+// the cached stitched file. Idempotent — deleting an already-empty session is
+// a no-op that still clears any stale stitched cache.
+func (h *Handler) DeleteSession(c *fiber.Ctx) error {
+	session := c.Params("sessionID")
+	if session == "" {
+		return c.Status(400).JSON(fiber.Map{"error": "missing session"})
+	}
+	tenantID := tenantOf(c)
+	segs, err := h.repo.ListAudioSegments(c.Context(), tenantID, session)
+	if err != nil {
+		return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+	}
+	for _, s := range segs {
+		if err := h.repo.SoftDelete(c.Context(), tenantID, s.ID); err != nil {
+			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+	_ = h.store.Delete(c.Context(), stitchedSessionKey(tenantID, session))
+	return c.JSON(fiber.Map{"deleted": len(segs)})
+}
+
+// stitchedSessionKey is the deterministic MinIO key for a session's stitched
+// audio (no DB row — presigned directly).
+func stitchedSessionKey(tenantID uuid.UUID, session string) string {
+	return fmt.Sprintf("audio_session/%s/%s.aac", tenantID, session)
+}
+
+// audioSessionFromName extracts the session id from a segment file name shaped
+// like audio_<session>_<seq>_<ts>.ext (session ids never contain '_').
+func audioSessionFromName(name string) string {
+	if !strings.HasPrefix(name, "audio_") {
+		return ""
+	}
+	parts := strings.SplitN(name, "_", 3) // ["audio", <session>, <rest>]
+	if len(parts) < 3 {
+		return ""
+	}
+	return parts[1]
 }
 
 func tenantOf(c *fiber.Ctx) uuid.UUID {

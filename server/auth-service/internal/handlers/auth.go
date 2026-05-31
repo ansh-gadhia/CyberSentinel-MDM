@@ -6,9 +6,21 @@ import (
 
 	"github.com/mdm/auth-service/internal/dto"
 	"github.com/mdm/auth-service/internal/service"
+	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 	apperr "github.com/mdm/shared/errors"
 	"github.com/mdm/shared/middleware"
 )
+
+// permStrings returns the permission strings a role holds (for API responses).
+func permStrings(role string) []string {
+	perms := authz.PermissionsFor(role)
+	out := make([]string, len(perms))
+	for i, p := range perms {
+		out[i] = string(p)
+	}
+	return out
+}
 
 type AuthHandler struct{ svc *service.AuthService }
 
@@ -43,6 +55,7 @@ func (h *AuthHandler) Login(c *fiber.Ctx) error {
 	resp.User.Email = pair.User.Email
 	resp.User.Role = string(pair.User.Role)
 	resp.User.TenantID = pair.User.TenantID.String()
+	resp.User.Permissions = permStrings(string(pair.User.Role))
 	return c.JSON(resp)
 }
 
@@ -72,6 +85,71 @@ func (h *AuthHandler) Logout(c *fiber.Ctx) error {
 	return c.SendStatus(204)
 }
 
+// Users lists the tenant's admin users (id/email/role) so the dashboard can
+// resolve audit-log actor UUIDs to a readable email. Gated to super_admin/admin
+// by the route. Tenant is taken from the caller's JWT claims.
+func (h *AuthHandler) Users(c *fiber.Ctx) error {
+	tenantStr, _ := c.Locals(middleware.CtxTenantID).(string)
+	tenantID, err := uuid.Parse(tenantStr)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "no tenant"})
+	}
+	users, err := h.svc.ListUsers(c.Context(), tenantID)
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	items := make([]dto.MeResponse, 0, len(users))
+	for _, u := range users {
+		items = append(items, dto.MeResponse{
+			ID:       u.ID.String(),
+			Email:    u.Email,
+			Role:     string(u.Role),
+			TenantID: u.TenantID.String(),
+		})
+	}
+	return c.JSON(fiber.Map{"items": items})
+}
+
+// ChangePassword updates the logged-in user's own password (verifies current).
+func (h *AuthHandler) ChangePassword(c *fiber.Ctx) error {
+	uidStr, _ := c.Locals(middleware.CtxUserID).(string)
+	id, err := uuid.Parse(uidStr)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "no user"})
+	}
+	var req dto.ChangePasswordRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "malformed"})
+	}
+	if err := h.svc.ChangePassword(c.Context(), id, req.OldPassword, req.NewPassword); err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.SendStatus(204)
+}
+
+// UpdateProfile updates the logged-in user's own profile (currently email).
+func (h *AuthHandler) UpdateProfile(c *fiber.Ctx) error {
+	uidStr, _ := c.Locals(middleware.CtxUserID).(string)
+	id, err := uuid.Parse(uidStr)
+	if err != nil {
+		return c.Status(401).JSON(fiber.Map{"error": "no user"})
+	}
+	var req dto.UpdateProfileRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "malformed"})
+	}
+	if req.Email == nil {
+		return c.Status(400).JSON(fiber.Map{"error": "nothing to update"})
+	}
+	u, err := h.svc.UpdateEmail(c.Context(), id, *req.Email)
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(dto.MeResponse{
+		ID: u.ID.String(), Email: u.Email, Role: string(u.Role), TenantID: u.TenantID.String(),
+	})
+}
+
 func (h *AuthHandler) Me(c *fiber.Ctx) error {
 	uidStr, _ := c.Locals(middleware.CtxUserID).(string)
 	id, err := uuid.Parse(uidStr)
@@ -83,9 +161,86 @@ func (h *AuthHandler) Me(c *fiber.Ctx) error {
 		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.JSON(dto.MeResponse{
-		ID:       u.ID.String(),
-		Email:    u.Email,
-		Role:     string(u.Role),
-		TenantID: u.TenantID.String(),
+		ID:          u.ID.String(),
+		Email:       u.Email,
+		Role:        string(u.Role),
+		TenantID:    u.TenantID.String(),
+		Permissions: permStrings(string(u.Role)),
 	})
+}
+
+// Roles returns the full RBAC matrix (roles, all permissions, role→permissions)
+// for the admin UI's Roles & Access page.
+func (h *AuthHandler) Roles(c *fiber.Ctx) error {
+	all := authz.AllPermissions()
+	perms := make([]string, len(all))
+	for i, p := range all {
+		perms[i] = string(p)
+	}
+	matrix := map[string][]string{}
+	for _, r := range authz.Roles() {
+		matrix[r] = permStrings(r)
+	}
+	return c.JSON(dto.RolesResponse{Roles: authz.Roles(), Permissions: perms, Matrix: matrix})
+}
+
+// CreateUser provisions a new admin user (user:manage / super_admin).
+func (h *AuthHandler) CreateUser(c *fiber.Ctx) error {
+	var req dto.CreateUserRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "malformed"})
+	}
+	u, err := h.svc.CreateUser(c.Context(), tenantOf(c), userOf(c), roleOf(c), req.Email, req.Password, req.Role)
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.Status(201).JSON(dto.MeResponse{
+		ID: u.ID.String(), Email: u.Email, Role: string(u.Role), TenantID: u.TenantID.String(),
+	})
+}
+
+// UpdateUserRole changes a user's role (user:manage / super_admin).
+func (h *AuthHandler) UpdateUserRole(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
+	}
+	var req dto.UpdateRoleRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "malformed"})
+	}
+	if err := h.svc.UpdateUserRole(c.Context(), tenantOf(c), userOf(c), roleOf(c), id, req.Role); err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.SendStatus(204)
+}
+
+// DeactivateUser soft-deletes a user (user:manage / super_admin).
+func (h *AuthHandler) DeactivateUser(c *fiber.Ctx) error {
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
+	}
+	if err := h.svc.DeactivateUser(c.Context(), tenantOf(c), userOf(c), roleOf(c), id); err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.SendStatus(204)
+}
+
+func tenantOf(c *fiber.Ctx) uuid.UUID {
+	s, _ := c.Locals(middleware.CtxTenantID).(string)
+	t, _ := uuid.Parse(s)
+	return t
+}
+func userOf(c *fiber.Ctx) uuid.UUID {
+	s, _ := c.Locals(middleware.CtxUserID).(string)
+	u, _ := uuid.Parse(s)
+	return u
+}
+func roleOf(c *fiber.Ctx) string {
+	claims, _ := c.Locals(middleware.CtxClaims).(*auth.Claims)
+	if claims == nil {
+		return ""
+	}
+	return claims.Role
 }

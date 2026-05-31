@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"strconv"
+	"strings"
 
 	"github.com/gofiber/fiber/v2"
 	"github.com/google/uuid"
@@ -47,10 +48,52 @@ func (h *DeviceHandler) Get(c *fiber.Ctx) error {
 	return c.JSON(d)
 }
 
+// Update handles admin-side PATCH /devices/:id. Currently the only mutable
+// field is the alias (gated to super_admin/admin by the route). The acting
+// user is recorded in the audit log.
 func (h *DeviceHandler) Update(c *fiber.Ctx) error {
-	// Currently only retire is supported here as a destructive update; group
-	// assignment / tags update would go in this handler in production.
-	return c.Status(501).JSON(fiber.Map{"error": "not implemented"})
+	tenantID := tenantOf(c)
+	id, err := uuid.Parse(c.Params("id"))
+	if err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
+	}
+	var req dto.UpdateDeviceRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(400).JSON(fiber.Map{"error": "malformed"})
+	}
+	if req.Alias != nil {
+		// Trim and treat an emptied field as "clear the alias" (store NULL).
+		alias := strings.TrimSpace(*req.Alias)
+		var aliasPtr *string
+		if alias != "" {
+			if len(alias) > 120 {
+				alias = alias[:120]
+			}
+			aliasPtr = &alias
+		}
+		if err := h.svc.UpdateAlias(c.Context(), tenantID, id, userOf(c), aliasPtr); err != nil {
+			return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+	if req.GroupID != nil {
+		// Empty string clears membership; otherwise must be a valid group UUID.
+		var groupPtr *uuid.UUID
+		if s := strings.TrimSpace(*req.GroupID); s != "" {
+			g, err := uuid.Parse(s)
+			if err != nil {
+				return c.Status(400).JSON(fiber.Map{"error": "invalid group_id"})
+			}
+			groupPtr = &g
+		}
+		if err := h.svc.SetGroup(c.Context(), tenantID, id, userOf(c), groupPtr); err != nil {
+			return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+		}
+	}
+	d, err := h.svc.Get(c.Context(), tenantID, id)
+	if err != nil {
+		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
+	}
+	return c.JSON(d)
 }
 
 func (h *DeviceHandler) Retire(c *fiber.Ctx) error {
@@ -59,7 +102,7 @@ func (h *DeviceHandler) Retire(c *fiber.Ctx) error {
 	if err != nil {
 		return c.Status(400).JSON(fiber.Map{"error": "invalid id"})
 	}
-	if err := h.svc.Retire(c.Context(), tenantID, id); err != nil {
+	if err := h.svc.Retire(c.Context(), tenantID, id, userOf(c)); err != nil {
 		return c.Status(apperr.HTTPStatus(err)).JSON(fiber.Map{"error": err.Error()})
 	}
 	return c.SendStatus(204)
@@ -99,4 +142,12 @@ func tenantOf(c *fiber.Ctx) uuid.UUID {
 	s, _ := c.Locals(middleware.CtxTenantID).(string)
 	t, _ := uuid.Parse(s)
 	return t
+}
+
+// userOf returns the acting admin's user UUID, or uuid.Nil if the request
+// wasn't made with a user token (so callers can omit ActorID from audit).
+func userOf(c *fiber.Ctx) uuid.UUID {
+	s, _ := c.Locals(middleware.CtxUserID).(string)
+	u, _ := uuid.Parse(s)
+	return u
 }

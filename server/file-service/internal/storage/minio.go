@@ -85,6 +85,26 @@ func (s *Storage) Put(ctx context.Context, key string, r io.Reader, size int64, 
 	return err
 }
 
+// Get opens an object for reading from internal storage. Used by the audio
+// session stitcher to read each segment and concatenate them.
+func (s *Storage) Get(ctx context.Context, key string) (io.ReadCloser, error) {
+	return s.cli.GetObject(ctx, s.bucket, key, minio.GetObjectOptions{})
+}
+
+// Stat returns an object's last-modified time and whether it exists, used to
+// decide if a cached stitched session file is still up to date.
+func (s *Storage) Stat(ctx context.Context, key string) (lastModified time.Time, exists bool, err error) {
+	info, err := s.cli.StatObject(ctx, s.bucket, key, minio.StatObjectOptions{})
+	if err != nil {
+		resp := minio.ToErrorResponse(err)
+		if resp.StatusCode == 404 || resp.Code == "NoSuchKey" {
+			return time.Time{}, false, nil
+		}
+		return time.Time{}, false, err
+	}
+	return info.LastModified, true, nil
+}
+
 // PresignDownload returns a presigned GET URL signed against the default
 // public endpoint (MINIO_PUBLIC_ENDPOINT). Use this only when there is no
 // per-request hint available — admin browser traffic should use

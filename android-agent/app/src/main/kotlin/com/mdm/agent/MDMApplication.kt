@@ -5,6 +5,7 @@ import androidx.hilt.work.HiltWorkerFactory
 import androidx.work.Configuration
 import com.mdm.command.CommandService
 import com.mdm.core.admin.DevicePolicyController
+import com.mdm.networking.auth.AuthRepository
 import dagger.hilt.android.HiltAndroidApp
 import timber.log.Timber
 import javax.inject.Inject
@@ -20,6 +21,7 @@ class MDMApplication : Application(), Configuration.Provider {
 
     @Inject lateinit var workerFactory: HiltWorkerFactory
     @Inject lateinit var dpm: DevicePolicyController
+    @Inject lateinit var auth: AuthRepository
 
     override val workManagerConfiguration: Configuration
         get() = Configuration.Builder().setWorkerFactory(workerFactory).build()
@@ -29,9 +31,11 @@ class MDMApplication : Application(), Configuration.Provider {
         if (BuildConfig.DEBUG) {
             Timber.plant(Timber.DebugTree())
         }
-        // Start the command channel whenever any admin role is active.
-        // The DPM gating inside individual ops handles DO-vs-DA capability.
-        if (dpm.isAdminActive()) {
+        // Start the command channel whenever the agent has something to do:
+        // any admin role OR an enrolled "none"-mode device (read-only telemetry
+        // + heartbeat so it reports mgmt_mode and can run the commands its mode
+        // permits). Per-op DPM gating handles DO-vs-DA-vs-none capability.
+        if (dpm.isAdminActive() || auth.isEnrolled()) {
             CommandService.start(this)
         }
     }

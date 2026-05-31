@@ -67,7 +67,8 @@ func (r *DeviceRepo) List(ctx context.Context, f ListFilter) ([]models.Device, i
 		args = append(args, "%"+f.Search+"%")
 		cond += " AND (serial_number ILIKE $" + itoa(len(args)) +
 			" OR imei ILIKE $" + itoa(len(args)) +
-			" OR model ILIKE $" + itoa(len(args)) + ")"
+			" OR model ILIKE $" + itoa(len(args)) +
+			" OR alias ILIKE $" + itoa(len(args)) + ")"
 	}
 	listQ := `SELECT * FROM devices WHERE ` + cond + ` ORDER BY created_at DESC LIMIT $2 OFFSET $3`
 	countQ := `SELECT COUNT(*) FROM devices WHERE ` + cond
@@ -142,6 +143,7 @@ type HeartbeatRich struct {
 	StorageFreeBytes    *int64
 	WifiSsid            *string
 	NetworkType         *string
+	MgmtMode            *string
 }
 
 func (r *DeviceRepo) Heartbeat(ctx context.Context, id uuid.UUID, hb HeartbeatRich) error {
@@ -191,12 +193,34 @@ func (r *DeviceRepo) Heartbeat(ctx context.Context, id uuid.UUID, hb HeartbeatRi
 	if hb.NetworkType != nil {
 		appendField(*hb.NetworkType, "last_network_type")
 	}
+	if hb.MgmtMode != nil {
+		appendField(*hb.MgmtMode, "last_mgmt_mode")
+	}
 
 	q := fmt.Sprintf(`UPDATE devices SET last_heartbeat_at = $1,
 	       state = CASE WHEN state = 'offline' THEN 'enrolled' ELSE state END%s
 	   WHERE id = $2`, locUpdate)
 	_, err := r.db.ExecContext(ctx, q, args...)
 	return err
+}
+
+// ModeAndTenant returns the device's last-reported management mode (nil if
+// never set) and its tenant. Used to detect owner/admin/none transitions on
+// heartbeat so the service can emit a tenant-scoped device.mode_changed audit
+// event.
+func (r *DeviceRepo) ModeAndTenant(ctx context.Context, id uuid.UUID) (mode *string, tenant uuid.UUID, err error) {
+	var row struct {
+		Mode     *string   `db:"last_mgmt_mode"`
+		TenantID uuid.UUID `db:"tenant_id"`
+	}
+	err = r.db.GetContext(ctx, &row, `SELECT last_mgmt_mode, tenant_id FROM devices WHERE id = $1`, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, uuid.Nil, ErrNotFound
+		}
+		return nil, uuid.Nil, err
+	}
+	return row.Mode, row.TenantID, nil
 }
 
 func (r *DeviceRepo) UpdateInfo(ctx context.Context, id uuid.UUID, mfr, mdl, os, patch *string) error {
@@ -208,6 +232,43 @@ func (r *DeviceRepo) UpdateInfo(ctx context.Context, id uuid.UUID, mfr, mdl, os,
 		       security_patch_level = COALESCE($4, security_patch_level)
 		 WHERE id = $5`, mfr, mdl, os, patch, id)
 	return err
+}
+
+// UpdateAlias sets (or clears, when alias is nil) the human-friendly device
+// label. Scoped by tenant so a caller can't relabel another tenant's device.
+// Returns ErrNotFound if no live device matched.
+func (r *DeviceRepo) UpdateAlias(ctx context.Context, tenantID, id uuid.UUID, alias *string) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE devices SET alias = $1
+		 WHERE tenant_id = $2 AND id = $3 AND deleted_at IS NULL`, alias, tenantID, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetGroup assigns (groupID != nil) or clears (groupID == nil) a device's
+// group. When setting, the group must exist in the same tenant — otherwise the
+// statement affects no rows and we return ErrNotFound, so a bad/cross-tenant
+// group id can't be written.
+func (r *DeviceRepo) SetGroup(ctx context.Context, tenantID, id uuid.UUID, groupID *uuid.UUID) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE devices SET group_id = $1
+		 WHERE tenant_id = $2 AND id = $3 AND deleted_at IS NULL
+		   AND ($1::uuid IS NULL OR EXISTS (
+		         SELECT 1 FROM device_groups g
+		          WHERE g.id = $1 AND g.tenant_id = $2 AND g.deleted_at IS NULL))`,
+		groupID, tenantID, id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrNotFound
+	}
+	return nil
 }
 
 func (r *DeviceRepo) Retire(ctx context.Context, tenantID, id uuid.UUID) error {

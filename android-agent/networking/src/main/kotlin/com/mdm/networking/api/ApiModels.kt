@@ -133,7 +133,8 @@ data class HeartbeatDto(
     @Json(name = "ip_address")              val ipAddress: String? = null,
     @Json(name = "mac_address")             val macAddress: String? = null,
     @Json(name = "storage_free_bytes")      val storageFreeBytes: Long? = null,
-    @Json(name = "wifi_ssid")               val wifiSsid: String? = null
+    @Json(name = "wifi_ssid")               val wifiSsid: String? = null,
+    @Json(name = "mgmt_mode")               val mgmtMode: String? = null
 )
 
 // ---------------------------- files ---------------------------------

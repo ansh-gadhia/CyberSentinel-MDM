@@ -19,6 +19,17 @@ type CommandRepo struct{ db *sqlx.DB }
 
 func NewCommandRepo(db *sqlx.DB) *CommandRepo { return &CommandRepo{db: db} }
 
+// DeviceIDsInGroup returns the live devices in a group, tenant-scoped. Used to
+// fan a broadcast command out to a whole group. Reads the shared devices table
+// directly (device-service owns it, but command-service shares the database).
+func (r *CommandRepo) DeviceIDsInGroup(ctx context.Context, tenantID, groupID uuid.UUID) ([]uuid.UUID, error) {
+	var ids []uuid.UUID
+	err := r.db.SelectContext(ctx, &ids,
+		`SELECT id FROM devices WHERE tenant_id = $1 AND group_id = $2 AND deleted_at IS NULL`,
+		tenantID, groupID)
+	return ids, err
+}
+
 func (r *CommandRepo) Insert(ctx context.Context, cmd *models.Command) error {
 	const q = `INSERT INTO commands
 	  (id, tenant_id, device_id, kind, payload, state, attempts, max_attempts, timeout_at, created_by)

@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from 'react';
-import { Link, useParams } from 'react-router-dom';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useParams, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   deviceTelemetryLatest, getDevice, issueCommand,
   latestResultByKind, listDeviceCommands, listDeviceEvents, retireDevice,
+  updateDeviceAlias,
   type ActivityEvent, type CommandRow, type Device
 } from '../api/devices';
 import {
@@ -11,14 +12,20 @@ import {
   unassignPolicy, type PolicyAssignment
 } from '../api/policies';
 import { listDevicePhotos, presignPhoto, deletePhoto } from '../api/photos';
+import { listDeviceAudios, presignAudio, deleteAudio, deleteAudioSession, parseAudioName, newSessionId, sessionAudioUrl } from '../api/audio';
+import type { FileObject } from '../api/files';
+import { listGroups, setDeviceGroup } from '../api/groups';
 import { formatRelative, isOnline } from '../components/online';
 import { toast } from '../components/toast';
+import { ModeBadge, ModeCapabilityCard, modeAllows, modeRequirement, normalizeMode } from '../components/DeviceMode';
+import { useCan } from '../lib/rbac';
 
-type TabId = 'overview' | 'policy' | 'apps' | 'photos' | 'activity' | 'commands';
+type TabId = 'overview' | 'policy' | 'apps' | 'photos' | 'audio' | 'activity' | 'commands';
 
 export function DeviceDetail() {
   const { id = '' } = useParams();
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const [tab, setTab] = useState<TabId>('overview');
 
   const { data: device } = useQuery({
@@ -43,7 +50,14 @@ export function DeviceDetail() {
   });
   const retire = useMutation({
     mutationFn: () => retireDevice(id),
-    onSuccess: () => toast.success('Device retired'),
+    onSuccess: () => {
+      toast.success('Device retired');
+      // The device we're viewing is now retired (soft-deleted) and the detail
+      // query will start 404ing — send the operator back to the list instead
+      // of stranding them on a dead page.
+      qc.invalidateQueries({ queryKey: ['devices'] });
+      navigate('/devices');
+    },
     onError:   () => toast.error('Retire failed')
   });
 
@@ -71,16 +85,25 @@ export function DeviceDetail() {
           <div className="text-xs text-slate-500"><Link to="/devices" className="hover:underline">Devices</Link> /</div>
           <div className="flex items-center gap-2 mt-0.5">
             <h1 className="text-2xl font-semibold truncate">
-              {device.manufacturer || 'Device'} {device.model || ''}
+              {device.alias?.trim() || `${device.manufacturer || 'Device'} ${device.model || ''}`.trim()}
             </h1>
             <ConnectionPill online={online} lastHeartbeat={device.last_heartbeat_at} />
             <StateBadge state={device.state} />
+            <ModeBadge mode={device.last_mgmt_mode} />
           </div>
-          <div className="text-sm text-slate-500 font-mono mt-1">{device.serial_number ?? device.id}</div>
+          <div className="text-sm text-slate-500 mt-1 flex items-center gap-2 flex-wrap">
+            {device.alias?.trim() && <span>{`${device.manufacturer || ''} ${device.model || ''}`.trim()}</span>}
+            <span className="font-mono">{device.serial_number ?? device.id}</span>
+          </div>
+          <div className="flex items-center gap-4 flex-wrap">
+            <AliasEditor device={device} />
+            <GroupSelector device={device} />
+          </div>
         </div>
         <button
           onClick={() => { if (confirm('Retire this device? It will no longer be managed.')) retire.mutate(); }}
-          className="text-sm px-3 py-1.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950">
+          disabled={retire.isPending}
+          className="text-sm px-3 py-1.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950 disabled:opacity-50">
           Retire
         </button>
       </header>
@@ -89,11 +112,112 @@ export function DeviceDetail() {
 
       {tab === 'overview' && <OverviewTab device={device} info={deviceInfo} cmd={cmd} telemetry={telemetry ?? null} />}
       {tab === 'policy'   && <PolicyTab   deviceID={id} cmd={cmd} />}
-      {tab === 'apps'     && <AppsTab    deviceID={id} inventory={appInventory} cmd={cmd} />}
+      {tab === 'apps'     && <AppsTab    deviceID={id} inventory={appInventory} cmd={cmd} mode={device.last_mgmt_mode} />}
       {tab === 'photos'   && <PhotosTab  deviceID={id} cmd={cmd} />}
+      {tab === 'audio'    && <AudiosTab  deviceID={id} cmd={cmd} />}
       {tab === 'activity' && <ActivityTab deviceID={id} />}
       {tab === 'commands' && <CommandsTab commands={commands} />}
     </div>
+  );
+}
+
+// AliasEditor renders the device's friendly name inline. super_admin/admin get
+// an editable field; everyone else sees it read-only (matching the server route
+// guard). Saving fires PATCH /devices/:id, which audit-logs who made the change.
+function AliasEditor({ device }: { device: Device }) {
+  const qc = useQueryClient();
+  const canEdit = useCan('device:update');
+  const [editing, setEditing] = useState(false);
+  const [value, setValue] = useState(device.alias ?? '');
+
+  const save = useMutation({
+    mutationFn: (alias: string) => updateDeviceAlias(device.id, alias),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['device', device.id] });
+      qc.invalidateQueries({ queryKey: ['devices'] });
+      toast.success('Alias updated');
+      setEditing(false);
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Failed to update alias')
+  });
+
+  if (!canEdit) {
+    // Read-only: only show a line if an alias actually exists.
+    if (!device.alias?.trim()) return null;
+    return <div className="text-xs text-slate-400 mt-1">Alias set by an administrator.</div>;
+  }
+
+  if (!editing) {
+    return (
+      <button
+        onClick={() => { setValue(device.alias ?? ''); setEditing(true); }}
+        className="text-xs text-brand-600 hover:underline mt-1 inline-block">
+        {device.alias?.trim() ? 'Edit alias' : '+ Add an alias'}
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2 mt-1.5">
+      <input
+        autoFocus
+        value={value}
+        maxLength={120}
+        onChange={e => setValue(e.target.value)}
+        onKeyDown={e => {
+          if (e.key === 'Enter') save.mutate(value);
+          if (e.key === 'Escape') setEditing(false);
+        }}
+        placeholder="e.g. Reception iPad"
+        className="text-sm rounded border bg-transparent px-2 py-1 w-56" />
+      <button
+        onClick={() => save.mutate(value)}
+        disabled={save.isPending}
+        className="text-xs px-2.5 py-1 rounded bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-50">
+        Save
+      </button>
+      <button onClick={() => setEditing(false)} className="text-xs px-2 py-1 text-slate-500">Cancel</button>
+    </div>
+  );
+}
+
+// GroupSelector shows (and, for super_admin/admin, lets you change) the device's
+// group. Assigning a group makes any group-level policy apply to this device —
+// visible immediately in the Policy tab's layered assignments.
+function GroupSelector({ device }: { device: Device }) {
+  const qc = useQueryClient();
+  const canEdit = useCan('device:update');
+  const { data: groups } = useQuery({ queryKey: ['groups'], queryFn: listGroups });
+
+  const change = useMutation({
+    mutationFn: (groupID: string) => setDeviceGroup(device.id, groupID),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['device', device.id] });
+      qc.invalidateQueries({ queryKey: ['device-assignments', device.id] });
+      qc.invalidateQueries({ queryKey: ['resolved-policy', device.id] });
+      qc.invalidateQueries({ queryKey: ['groups'] });
+      toast.success('Group updated');
+    },
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Failed to set group')
+  });
+
+  const current = groups?.find(g => g.id === device.group_id);
+
+  if (!canEdit) {
+    return <span className="text-xs text-slate-500">Group: <b>{current?.name ?? 'none'}</b></span>;
+  }
+  return (
+    <label className="text-xs text-slate-500 flex items-center gap-1.5">
+      Group:
+      <select
+        value={device.group_id ?? ''}
+        onChange={e => change.mutate(e.target.value)}
+        disabled={change.isPending}
+        className="text-xs rounded border bg-transparent px-2 py-1">
+        <option value="">none</option>
+        {groups?.map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
+      </select>
+    </label>
   );
 }
 
@@ -110,6 +234,7 @@ function Tabs({ current, onSelect, commands }: {
     { id: 'policy',   label: 'Policy' },
     { id: 'apps',     label: 'Apps' },
     { id: 'photos',   label: 'Photos & Location' },
+    { id: 'audio',    label: 'Audio' },
     { id: 'activity', label: 'Activity' },
     { id: 'commands', label: 'Commands', hint: pendingCount > 0 ? `${pendingCount} pending` : undefined }
   ];
@@ -147,14 +272,32 @@ function OverviewTab({
   telemetry: Record<string, unknown> | null;
   cmd: ReturnType<typeof useMutation<any, any, { kind: string; payload?: Record<string, unknown> }>>;
 }) {
+  const m = device.last_mgmt_mode;
+  const canBasic = useCan('command:issue:basic');
+  const canPriv = useCan('command:issue:privileged');
+  // Combine device-capability (mode) gating with user-permission (RBAC) gating.
+  const gate = (modeOK: boolean, permOK: boolean, modeMsg?: string) => ({
+    disabled: !modeOK || !permOK,
+    title: !permOK ? 'Your role cannot issue this command' : modeMsg
+  });
   return (
     <div className="space-y-5">
       <section className="grid grid-cols-2 md:grid-cols-4 gap-3">
         <Stat label="OS" value={device.os_version ?? '—'} hint={device.security_patch_level ? `patch ${device.security_patch_level}` : undefined} />
         <Stat label="Applied policy" value={`v${device.applied_policy_version}`} />
-        <Stat label="Battery" value={info ? `${info.battery_pct}%` : '—'} hint={info?.charging ? 'charging' : undefined} />
-        <Stat label="Network" value={(info?.network as string) ?? '—'} />
+        <Stat
+          label="Battery"
+          // device.last_battery_pct is refreshed by the agent's 60s heartbeat
+          // and re-fetched by the parent useQuery every 5s, so this updates
+          // live. The FETCH_DEVICE_INFO `info` snapshot is a one-shot run on
+          // page load and would otherwise show stale values forever.
+          value={device.last_battery_pct != null ? `${device.last_battery_pct}%` : (info ? `${info.battery_pct}%` : '—')}
+          hint={device.last_charging ?? info?.charging ? 'charging' : undefined}
+        />
+        <Stat label="Network" value={device.last_network_type ?? (info?.network as string) ?? '—'} />
       </section>
+
+      <ModeCapabilityCard mode={device.last_mgmt_mode} />
 
       <PolicyCard deviceID={device.id} cmd={cmd} />
 
@@ -163,28 +306,42 @@ function OverviewTab({
         <h2 className="font-medium mb-3">Remote actions</h2>
         <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
           <ActionGroup title="Maintenance">
-            <ActionBtn label="Lock screen" onClick={() => cmd.mutate({ kind: 'LOCK' })} />
-            <ActionBtn label="Reboot"      onClick={() => cmd.mutate({ kind: 'REBOOT' })} />
+            <ActionBtn label="Lock screen" onClick={() => cmd.mutate({ kind: 'LOCK' })}
+                       {...gate(modeAllows(m, 'lock'), canBasic, modeRequirement(m, 'lock'))} />
+            <ActionBtn label="Reboot"      onClick={() => cmd.mutate({ kind: 'REBOOT' })}
+                       {...gate(modeAllows(m, 'reboot'), canPriv, modeRequirement(m, 'reboot'))} />
           </ActionGroup>
           <ActionGroup title="Security">
-            <ResetPasswordBtn onSubmit={(pw) => cmd.mutate({ kind: 'RESET_PASSWORD', payload: { password: pw } })} />
-            <WipeBtn onConfirm={() => cmd.mutate({ kind: 'WIPE', payload: { external_storage: true, reset_protection: true } })} />
+            <ResetPasswordBtn onSubmit={(pw) => cmd.mutate({ kind: 'RESET_PASSWORD', payload: { password: pw } })}
+                              {...gate(modeAllows(m, 'reset_password'), canPriv, modeRequirement(m, 'reset_password'))} />
+            <WipeBtn onConfirm={() => cmd.mutate({ kind: 'WIPE', payload: { external_storage: true, reset_protection: true } })}
+                     {...gate(modeAllows(m, 'wipe'), canPriv, modeRequirement(m, 'wipe'))} />
           </ActionGroup>
           <ActionGroup title="Asset recovery">
-            <FlashlightToggle cmd={cmd} />
-            <ActionBtn label="Play alarm sound" onClick={() => cmd.mutate({ kind: 'PLAY_SOUND', payload: { duration_ms: 15000 } })} />
-            <ActionBtn label="Get location" onClick={() => cmd.mutate({ kind: 'GET_LOCATION' })} />
+            <FlashlightToggle cmd={cmd} disabled={!canBasic} />
+            <ActionBtn label="Play alarm sound" onClick={() => cmd.mutate({ kind: 'PLAY_SOUND', payload: { duration_ms: 15000 } })}
+                       {...gate(true, canBasic)} />
+            <ActionBtn label="Get location" onClick={() => cmd.mutate({ kind: 'GET_LOCATION' })}
+                       {...gate(true, canBasic)} />
           </ActionGroup>
           <ActionGroup title="Inventory">
-            <ActionBtn label="Refresh device info"   onClick={() => cmd.mutate({ kind: 'FETCH_DEVICE_INFO' })} />
-            <ActionBtn label="Refresh app inventory" onClick={() => cmd.mutate({ kind: 'FETCH_APP_INVENTORY' })} />
+            <ActionBtn label="Refresh device info"   onClick={() => cmd.mutate({ kind: 'FETCH_DEVICE_INFO' })}
+                       {...gate(true, canBasic)} />
+            <ActionBtn label="Refresh app inventory" onClick={() => cmd.mutate({ kind: 'FETCH_APP_INVENTORY' })}
+                       {...gate(true, canBasic)} />
+          </ActionGroup>
+          <ActionGroup title="Messaging">
+            <SendMessageBtn
+              disabled={!canBasic}
+              title={canBasic ? undefined : 'Your role cannot send messages'}
+              onSend={(t, m) => cmd.mutate({ kind: 'SHOW_MESSAGE', payload: { title: t, message: m } })} />
           </ActionGroup>
         </div>
       </section>
 
       <LiveLocationCard device={device} />
 
-      <DeviceInfoCard info={info} />
+      <DeviceInfoCard device={device} info={info} />
 
       {telemetry && Object.keys(telemetry).length > 0 && (
         <section className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4">
@@ -253,14 +410,17 @@ function PolicyCard({ deviceID, cmd }: {
   );
 }
 
-function FlashlightToggle({ cmd }: {
+function FlashlightToggle({ cmd, disabled }: {
   cmd: ReturnType<typeof useMutation<any, any, { kind: string; payload?: Record<string, unknown> }>>;
+  disabled?: boolean;
 }) {
   const [on, setOn] = useState(false);
   return (
     <button
+      disabled={disabled}
+      title={disabled ? 'Your role cannot issue this command' : undefined}
       onClick={() => { setOn(!on); cmd.mutate({ kind: 'SET_FLASHLIGHT', payload: { on: !on } }); }}
-      className={`text-sm text-left px-3 py-1.5 rounded border transition-colors ${on
+      className={`text-sm text-left px-3 py-1.5 rounded border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${on
         ? 'bg-amber-100 border-amber-400 text-amber-900 dark:bg-amber-950 dark:text-amber-200'
         : 'hover:bg-slate-50 dark:hover:bg-slate-800'}`}>
       Flashlight: {on ? 'ON' : 'off'}
@@ -270,11 +430,19 @@ function FlashlightToggle({ cmd }: {
 
 /* ============================== Apps Tab ============================== */
 
-function AppsTab({ deviceID: _deviceID, inventory, cmd }: {
+function AppsTab({ deviceID: _deviceID, inventory, cmd, mode }: {
   deviceID: string;
   inventory: Record<string, unknown> | null;
   cmd: ReturnType<typeof useMutation<any, any, { kind: string; payload?: Record<string, unknown> }>>;
+  mode?: string | null;
 }) {
+  // App management commands are privileged — require both the device mode AND
+  // the user's command:issue:privileged permission.
+  const canPrivCmd = useCan('command:issue:privileged');
+  const canManage = modeAllows(mode, 'app_manage') && canPrivCmd;
+  const canUninstall = modeAllows(mode, 'app_uninstall') && canPrivCmd;
+  const manageReq = !canPrivCmd ? 'Your role cannot manage apps' : modeRequirement(mode, 'app_manage');
+  const uninstallReq = !canPrivCmd ? 'Your role cannot uninstall apps' : modeRequirement(mode, 'app_uninstall');
   const [filter, setFilter] = useState('');
   const [showSystem, setShowSystem] = useState(true);
   const [actOn, setActOn] = useState<Record<string, unknown> | null>(null);
@@ -325,7 +493,7 @@ function AppsTab({ deviceID: _deviceID, inventory, cmd }: {
 
       <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 overflow-x-auto">
         <table className="w-full text-sm min-w-[760px]">
-          <thead className="bg-slate-50 dark:bg-slate-800 text-left text-slate-500 sticky top-[42px]">
+          <thead className="bg-slate-50 dark:bg-slate-800 text-left text-slate-500 border-b border-slate-200 dark:border-slate-700">
             <tr>
               <th className="px-3 py-2 font-normal">Label</th>
               <th className="px-3 py-2 font-normal">Package</th>
@@ -349,17 +517,20 @@ function AppsTab({ deviceID: _deviceID, inventory, cmd }: {
                   <td className="px-3 py-1.5 text-right">
                     <div className="inline-flex gap-1 items-center">
                       <button
-                        title="Hide from launcher"
+                        title={manageReq ?? 'Hide from launcher'}
+                        disabled={!canManage}
                         onClick={() => cmd.mutate({ kind: 'HIDE_APP', payload: { package_name: pkg } })}
-                        className="text-xs px-2 py-0.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">Hide</button>
+                        className="text-xs px-2 py-0.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed">Hide</button>
                       <button
-                        title="Block uninstall"
+                        title={manageReq ?? 'Block uninstall'}
+                        disabled={!canManage}
                         onClick={() => cmd.mutate({ kind: 'BLOCK_UNINSTALL', payload: { package_name: pkg } })}
-                        className="text-xs px-2 py-0.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">Block</button>
+                        className="text-xs px-2 py-0.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed">Block</button>
                       <button
-                        title="Uninstall this app"
+                        title={uninstallReq ?? 'Uninstall this app'}
+                        disabled={!canUninstall}
                         onClick={() => { if (confirm(`Uninstall ${a.label}?`)) cmd.mutate({ kind: 'UNINSTALL_APP', payload: { package_name: pkg } }); }}
-                        className="text-xs px-2 py-0.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950">Uninstall</button>
+                        className="text-xs px-2 py-0.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950 disabled:opacity-40 disabled:cursor-not-allowed">Uninstall</button>
                       <button
                         title="All actions (Show, Allow uninstall, Clear data…)"
                         onClick={() => setActOn(a)}
@@ -380,7 +551,7 @@ function AppsTab({ deviceID: _deviceID, inventory, cmd }: {
         Fetched {inventory.fetched_at ? new Date(inventory.fetched_at as string).toLocaleString() : '—'}
       </p>
       <DAModeNotice />
-      {actOn && <AppActionModal app={actOn} onClose={() => setActOn(null)} cmd={cmd} />}
+      {actOn && <AppActionModal app={actOn} onClose={() => setActOn(null)} cmd={cmd} mode={mode} />}
     </div>
   );
 }
@@ -394,12 +565,16 @@ function DAModeNotice() {
   );
 }
 
-function AppActionModal({ app, onClose, cmd }: {
+function AppActionModal({ app, onClose, cmd, mode }: {
   app: Record<string, unknown>;
   onClose: () => void;
   cmd: ReturnType<typeof useMutation<any, any, { kind: string; payload?: Record<string, unknown> }>>;
+  mode?: string | null;
 }) {
   const pkg = app.package as string;
+  const canPrivCmd = useCan('command:issue:privileged');
+  const canManage = modeAllows(mode, 'app_manage') && canPrivCmd;
+  const canUninstall = modeAllows(mode, 'app_uninstall') && canPrivCmd;
   const fire = (kind: string, payload?: Record<string, unknown>) => {
     cmd.mutate({ kind, payload: { package_name: pkg, ...(payload || {}) } });
     onClose();
@@ -412,13 +587,18 @@ function AppActionModal({ app, onClose, cmd }: {
           <div className="font-medium text-lg">{app.label as string}</div>
           <div className="font-mono text-xs text-slate-500">{pkg}</div>
         </div>
+        {!canManage && (
+          <div className="text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-900 rounded p-2">
+            Most app-management actions require Device Owner. This device is in <b>{normalizeMode(mode) === 'admin' ? 'Device Admin' : 'Enrolled only'}</b> mode.
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-2 pt-1">
-          <ModalBtn label="Hide from launcher"  desc="App icon removed, package stays installed" onClick={() => fire('HIDE_APP')} />
-          <ModalBtn label="Show in launcher"    desc="Reverse of hide"                            onClick={() => fire('SHOW_APP')} />
-          <ModalBtn label="Block uninstall"     desc="Prevent user from uninstalling"             onClick={() => fire('BLOCK_UNINSTALL')} />
-          <ModalBtn label="Allow uninstall"     desc="Reverse of block"                           onClick={() => fire('ALLOW_UNINSTALL')} />
-          <ModalBtn label="Clear app data"      desc="Wipe sharedPrefs, DB, cache (DO only)"      onClick={() => fire('CLEAR_APP_DATA')} />
-          <ModalBtn label="Uninstall"           desc="Remove the package (DO silent / DA prompt)" tone="danger" onClick={() => { if (confirm(`Uninstall ${app.label}?`)) fire('UNINSTALL_APP'); }} />
+          <ModalBtn label="Hide from launcher"  desc="App icon removed, package stays installed" disabled={!canManage} onClick={() => fire('HIDE_APP')} />
+          <ModalBtn label="Show in launcher"    desc="Reverse of hide"                            disabled={!canManage} onClick={() => fire('SHOW_APP')} />
+          <ModalBtn label="Block uninstall"     desc="Prevent user from uninstalling"             disabled={!canManage} onClick={() => fire('BLOCK_UNINSTALL')} />
+          <ModalBtn label="Allow uninstall"     desc="Reverse of block"                           disabled={!canManage} onClick={() => fire('ALLOW_UNINSTALL')} />
+          <ModalBtn label="Clear app data"      desc="Wipe sharedPrefs, DB, cache (DO only)"      disabled={!canManage} onClick={() => fire('CLEAR_APP_DATA')} />
+          <ModalBtn label="Uninstall"           desc="Remove the package (DO silent / DA prompt)" tone="danger" disabled={!canUninstall} onClick={() => { if (confirm(`Uninstall ${app.label}?`)) fire('UNINSTALL_APP'); }} />
         </div>
         <div className="flex justify-end pt-1">
           <button onClick={onClose} className="text-sm px-3 py-1.5">Close</button>
@@ -428,12 +608,13 @@ function AppActionModal({ app, onClose, cmd }: {
   );
 }
 
-function ModalBtn({ label, desc, onClick, tone }: { label: string; desc: string; onClick: () => void; tone?: 'danger' }) {
+function ModalBtn({ label, desc, onClick, tone, disabled }: { label: string; desc: string; onClick: () => void; tone?: 'danger'; disabled?: boolean }) {
   const cls = tone === 'danger'
     ? 'border-rose-300 hover:bg-rose-50 dark:hover:bg-rose-950 text-rose-700 dark:text-rose-300'
     : 'hover:bg-slate-50 dark:hover:bg-slate-800';
   return (
-    <button onClick={onClick} className={`text-left rounded border p-2.5 text-xs ${cls}`}>
+    <button onClick={onClick} disabled={disabled}
+            className={`text-left rounded border p-2.5 text-xs ${cls} disabled:opacity-40 disabled:cursor-not-allowed`}>
       <div className="font-medium text-sm">{label}</div>
       <div className="text-slate-500 mt-0.5">{desc}</div>
     </button>
@@ -455,6 +636,7 @@ function PhotosTab({ deviceID, cmd }: {
   const [lens, setLens] = useState<'BACK' | 'FRONT'>('BACK');
   const [withFlash, setWithFlash] = useState(false);
   const [preview, setPreview] = useState<{ url: string; id: string } | null>(null);
+  const canCapture = useCan('command:issue:surveillance');
 
   const remove = useMutation({
     mutationFn: (id: string) => deletePhoto(id),
@@ -480,7 +662,9 @@ function PhotosTab({ deviceID, cmd }: {
           </label>
           <button
             onClick={() => cmd.mutate({ kind: 'CAPTURE_PHOTO', payload: { lens, with_flash: withFlash } })}
-            className="text-sm px-3 py-1.5 rounded bg-brand-600 hover:bg-brand-700 text-white">
+            disabled={!canCapture}
+            title={canCapture ? undefined : 'Your role cannot capture photos (surveillance permission required)'}
+            className="text-sm px-3 py-1.5 rounded bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-40 disabled:cursor-not-allowed">
             📸 Capture now
           </button>
         </div>
@@ -536,6 +720,371 @@ function ImagePreview({ url, onClose }: { url: string; onClose: () => void }) {
   return (
     <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center" onClick={onClose}>
       <img src={url} alt="" className="max-w-[95vw] max-h-[95vh] rounded-lg shadow-2xl" />
+    </div>
+  );
+}
+
+/* ============================== Audio Tab ============================== */
+
+const SEGMENT_SEC = 5;     // length of each uploaded chunk
+const MAX_SESSION_SEC = 300; // hard cap so a forgotten session can't record forever
+
+function AudiosTab({ deviceID, cmd }: {
+  deviceID: string;
+  cmd: ReturnType<typeof useMutation<any, any, { kind: string; payload?: Record<string, unknown> }>>;
+}) {
+  const qc = useQueryClient();
+  // While a session is live we poll fast so new segments surface quickly for
+  // near-live playback; otherwise the archive can refresh lazily.
+  const [session, setSession] = useState<string | null>(null);
+  const canCapture = useCan('command:issue:surveillance');
+  const { data: audios, isLoading } = useQuery({
+    queryKey: ['audios', deviceID],
+    queryFn: () => listDeviceAudios(deviceID),
+    refetchInterval: session ? 2500 : 8000
+  });
+  const [preview, setPreview] = useState<string | null>(null);
+
+  const remove = useMutation({
+    mutationFn: (fid: string) => deleteAudio(fid),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['audios', deviceID] }); toast.success('Segment deleted'); }
+  });
+  const removeSession = useMutation({
+    mutationFn: (sid: string) => deleteAudioSession(sid),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ['audios', deviceID] }); toast.success('Recording deleted'); },
+    onError: (e: any) => toast.error(e?.response?.data?.error || 'Delete failed')
+  });
+
+  // Segments of the currently-live session, ordered by sequence.
+  const liveSegments = useMemo(() => {
+    if (!session) return [];
+    return (audios ?? [])
+      .map(a => ({ a, p: parseAudioName(a.name) }))
+      .filter(x => x.p.session === session)
+      .sort((x, y) => (x.p.seq ?? 0) - (y.p.seq ?? 0))
+      .map(x => x.a);
+  }, [audios, session]);
+
+  // Group every stored recording by session for the archive list.
+  const groups = useMemo(() => groupAudios(audios ?? []), [audios]);
+
+  const startListening = () => {
+    const sid = newSessionId();
+    setSession(sid);
+    cmd.mutate({
+      kind: 'START_AUDIO_STREAM',
+      payload: { session_id: sid, segment_sec: SEGMENT_SEC, max_sec: MAX_SESSION_SEC, source: 'MIC' }
+    });
+  };
+  const stopListening = () => {
+    if (session) cmd.mutate({ kind: 'STOP_AUDIO_STREAM', payload: { session_id: session } });
+    setSession(null);
+  };
+
+  return (
+    <div className="space-y-4">
+      <section className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4">
+        <div className="flex items-center justify-between">
+          <h2 className="font-medium">Live audio</h2>
+          {session
+            ? <button onClick={stopListening}
+                      className="text-sm px-3 py-1.5 rounded bg-rose-600 hover:bg-rose-700 text-white">■ Stop listening</button>
+            : <button onClick={startListening} disabled={!canCapture}
+                      title={canCapture ? undefined : 'Your role cannot capture audio (surveillance permission required)'}
+                      className="text-sm px-3 py-1.5 rounded bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-40 disabled:cursor-not-allowed">🎙 Start listening</button>}
+        </div>
+        {session ? (
+          <div className="mt-3">
+            <div className="inline-flex items-center gap-2 text-xs text-rose-600 font-medium mb-2">
+              <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse" /> LIVE — recording the mic in {SEGMENT_SEC}s segments
+            </div>
+            <LiveAudioPlayer segments={liveSegments} />
+            <p className="text-xs text-slate-500 mt-2">
+              Playback runs ~{SEGMENT_SEC}–{SEGMENT_SEC * 2}s behind real time (each segment must finish recording and upload first).
+              Auto-stops after {MAX_SESSION_SEC / 60} min. Every segment is saved below.
+            </p>
+          </div>
+        ) : (
+          <p className="text-xs text-slate-500 mt-2">
+            Streams the device microphone to your browser in short segments and archives every one.
+            Requires RECORD_AUDIO — auto-granted in Device Owner mode. A mic privacy indicator shows on the device (Android 12+).
+          </p>
+        )}
+      </section>
+
+      <section>
+        <h2 className="font-medium mb-3">Recordings</h2>
+        {isLoading && <div className="text-sm text-slate-500">Loading…</div>}
+        {!isLoading && groups.length === 0 && (
+          <div className="text-center py-10 text-slate-500 text-sm border border-dashed border-slate-200 dark:border-slate-700 rounded-lg">
+            No recordings yet. Click "Start listening" above.
+          </div>
+        )}
+        <div className="space-y-3">
+          {groups.map(g => (
+            <AudioSessionCard
+              key={g.key}
+              group={g}
+              activeSession={session}
+              onPlay={setPreview}
+              onDelete={(fid) => { if (confirm('Delete this recording segment?')) remove.mutate(fid); }}
+              onDeleteSession={() => {
+                if (!confirm('Delete this entire recording (all segments)? This cannot be undone.')) return;
+                if (g.session) removeSession.mutate(g.session);
+                else g.segments.forEach(s => remove.mutate(s.id)); // legacy/standalone
+              }}
+            />
+          ))}
+        </div>
+      </section>
+      {preview && <AudioPreview url={preview} onClose={() => setPreview(null)} />}
+    </div>
+  );
+}
+
+interface AudioGroup { key: string; session: string | null; startedAt: string; segments: FileObject[]; totalBytes: number }
+
+// groupAudios buckets segments by session id (newest session first), so a live
+// listen session shows up as one collapsible recording rather than N rows.
+function groupAudios(list: FileObject[]): AudioGroup[] {
+  const byKey = new Map<string, AudioGroup>();
+  for (const a of list) {
+    const { session, seq } = parseAudioName(a.name);
+    const key = session ?? a.id; // unrecognised names stand alone
+    let g = byKey.get(key);
+    if (!g) { g = { key, session, startedAt: a.created_at, segments: [], totalBytes: 0 }; byKey.set(key, g); }
+    g.segments.push(a);
+    g.totalBytes += a.size_bytes;
+    if (new Date(a.created_at) < new Date(g.startedAt)) g.startedAt = a.created_at;
+    void seq;
+  }
+  const groups = Array.from(byKey.values());
+  for (const g of groups) {
+    g.segments.sort((x, y) => (parseAudioName(x.name).seq ?? 0) - (parseAudioName(y.name).seq ?? 0));
+  }
+  groups.sort((a, b) => new Date(b.startedAt).getTime() - new Date(a.startedAt).getTime());
+  return groups;
+}
+
+// LiveAudioPlayer plays a session's segments back-to-back. As new segments are
+// uploaded they're appended; when the current one ends we advance. If we're
+// caught up (idle at the end) and a new segment lands, an effect resumes play.
+function LiveAudioPlayer({ segments }: { segments: FileObject[] }) {
+  const [idx, setIdx] = useState(0);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const seg = segments[idx];
+
+  const { data: presign } = useQuery({
+    queryKey: ['audio-url', seg?.id],
+    queryFn: () => presignAudio(seg!.id),
+    enabled: !!seg,
+    staleTime: 8 * 60 * 1000
+  });
+
+  // New src → attempt to play (best-effort; browser may require the user to
+  // press play once if autoplay-with-sound is blocked).
+  useEffect(() => {
+    if (presign?.url && audioRef.current) audioRef.current.play().catch(() => {});
+  }, [presign?.url]);
+
+  // If more segments arrived while we were stalled at the very end, step to the
+  // next unplayed one to keep the live feed flowing.
+  useEffect(() => {
+    if (idx < segments.length - 1 && audioRef.current?.ended) setIdx(idx + 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [segments.length]);
+
+  if (segments.length === 0) {
+    return <div className="text-sm text-slate-500">Waiting for the first segment from the device…</div>;
+  }
+
+  return (
+    <div className="flex items-center gap-3">
+      <audio
+        ref={audioRef}
+        src={presign?.url}
+        controls
+        autoPlay
+        onEnded={() => { if (idx < segments.length - 1) setIdx(idx + 1); }}
+        className="flex-1" />
+      <div className="text-xs text-slate-500 whitespace-nowrap">
+        segment {Math.min(idx + 1, segments.length)} / {segments.length}
+        <button onClick={() => setIdx(segments.length - 1)} className="ml-2 text-brand-600 hover:underline">jump to live</button>
+      </div>
+    </div>
+  );
+}
+
+function fmtSec(s: number): string {
+  const m = Math.floor(s / 60);
+  const sec = Math.floor(s % 60);
+  return `${m}:${sec.toString().padStart(2, '0')}`;
+}
+
+// Plays a whole recording session as one continuous track: a single Play/Pause
+// that auto-advances through the session's segments, with the next segment
+// prefetched so the hand-off is near-seamless. The user never clicks per
+// segment.
+function ContinuousSessionPlayer({ segments }: { segments: FileObject[] }) {
+  const [idx, setIdx] = useState(0);
+  const [playing, setPlaying] = useState(false);
+  const [pos, setPos] = useState(0); // seconds within the current segment
+  const audioRef = useRef<HTMLAudioElement>(null);
+
+  const cur = segments[idx];
+  const next = segments[idx + 1];
+  const { data: curUrl } = useQuery({
+    queryKey: ['audio-url', cur?.id], queryFn: () => presignAudio(cur!.id),
+    enabled: !!cur, staleTime: 8 * 60 * 1000
+  });
+  // Prefetch the next segment's URL so advancing is instant.
+  useQuery({
+    queryKey: ['audio-url', next?.id], queryFn: () => presignAudio(next!.id),
+    enabled: !!next, staleTime: 8 * 60 * 1000
+  });
+
+  // Whenever the source (current segment) changes while playing, keep playing.
+  useEffect(() => {
+    if (playing && curUrl?.url && audioRef.current) audioRef.current.play().catch(() => {});
+  }, [curUrl?.url, idx, playing]);
+
+  const totalApprox = segments.length * SEGMENT_SEC;
+  const elapsedApprox = idx * SEGMENT_SEC + Math.min(pos, SEGMENT_SEC);
+
+  const toggle = () => {
+    if (playing) { audioRef.current?.pause(); setPlaying(false); }
+    else { setPlaying(true); audioRef.current?.play().catch(() => {}); }
+  };
+
+  return (
+    <div className="flex items-center gap-3">
+      <button
+        onClick={toggle}
+        className="shrink-0 w-9 h-9 rounded-full bg-brand-600 hover:bg-brand-700 text-white flex items-center justify-center"
+        aria-label={playing ? 'Pause' : 'Play'}>
+        {playing ? '❚❚' : '▶'}
+      </button>
+      <div className="flex-1 min-w-0">
+        <div className="h-1.5 rounded-full bg-slate-200 dark:bg-slate-700 overflow-hidden">
+          <div className="h-full bg-brand-600 transition-[width] duration-300"
+               style={{ width: `${totalApprox ? Math.min(100, (elapsedApprox / totalApprox) * 100) : 0}%` }} />
+        </div>
+      </div>
+      <span className="text-xs text-slate-500 whitespace-nowrap tabular-nums">
+        {fmtSec(elapsedApprox)} / ~{fmtSec(totalApprox)}
+      </span>
+      <audio
+        ref={audioRef}
+        src={curUrl?.url}
+        className="hidden"
+        onTimeUpdate={e => setPos((e.currentTarget as HTMLAudioElement).currentTime)}
+        onEnded={() => {
+          if (idx < segments.length - 1) { setIdx(idx + 1); setPos(0); }
+          else { setPlaying(false); setIdx(0); setPos(0); }
+        }} />
+    </div>
+  );
+}
+
+// StitchedSessionPlayer plays a whole session as one continuous file. The
+// server concatenates the session's AAC/ADTS segments on demand (cached), so
+// this is a single native <audio> with real scrubbing — no segment hand-off.
+function StitchedSessionPlayer({ sessionId, live }: { sessionId: string; live?: boolean }) {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ['audio-session', sessionId],
+    queryFn: () => sessionAudioUrl(sessionId),
+    staleTime: 60 * 1000,
+    refetchInterval: live ? 5000 : false, // a live session keeps growing
+    retry: false
+  });
+  if (isLoading) return <div className="text-xs text-slate-500">Preparing recording…</div>;
+  if (isError || !data) return <div className="text-xs text-rose-500">Couldn't assemble this recording.</div>;
+  return <audio controls src={data.url} className="w-full" preload="metadata" />;
+}
+
+function AudioSessionCard({ group, activeSession, onPlay, onDelete, onDeleteSession }: {
+  group: AudioGroup;
+  activeSession: string | null;
+  onPlay: (url: string) => void;
+  onDelete: (fileID: string) => void;
+  onDeleteSession: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const isLive = group.session != null && group.session === activeSession;
+  const dur = group.segments.length * SEGMENT_SEC;
+  return (
+    <div className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-3 space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="text-sm font-medium flex items-center gap-2">
+            {new Date(group.startedAt).toLocaleString()}
+            {isLive && <span className="text-[10px] px-1.5 py-0.5 rounded bg-rose-100 text-rose-700 dark:bg-rose-950 dark:text-rose-300">LIVE</span>}
+          </div>
+          <div className="text-xs text-slate-500">
+            ~{dur}s · {group.segments.length} segment{group.segments.length === 1 ? '' : 's'} · {(group.totalBytes / 1024).toFixed(0)} KB
+          </div>
+        </div>
+        <div className="flex items-center gap-3 shrink-0">
+          <button onClick={() => setOpen(o => !o)} className="text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-300">
+            {open ? 'hide segments' : 'segments'}
+          </button>
+          <button onClick={onDeleteSession}
+                  className="text-xs px-2 py-1 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950">
+            Delete recording
+          </button>
+        </div>
+      </div>
+
+      {/* One player for the whole session. New (AAC/ADTS) sessions are stitched
+          server-side into a single scrubbable file; legacy MP4 sessions fall
+          back to the gapless-ish sequential player. */}
+      {group.session && group.segments.every(s => s.name.toLowerCase().endsWith('.aac'))
+        ? <StitchedSessionPlayer sessionId={group.session} live={isLive} />
+        : <ContinuousSessionPlayer segments={group.segments} />}
+
+      {open && (
+        <ul className="border-t border-slate-100 dark:border-slate-800 divide-y divide-slate-100 dark:divide-slate-800 -mx-3 -mb-3">
+          {group.segments.map((s, i) => (
+            <AudioSegmentRow key={s.id} segment={s} index={i} onPlay={onPlay} onDelete={() => onDelete(s.id)} />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function AudioSegmentRow({ segment, index, onPlay, onDelete }: {
+  segment: FileObject; index: number; onPlay: (url: string) => void; onDelete: () => void;
+}) {
+  const { data } = useQuery({
+    queryKey: ['audio-url', segment.id],
+    queryFn: () => presignAudio(segment.id),
+    staleTime: 8 * 60 * 1000
+  });
+  return (
+    <li className="flex items-center justify-between gap-3 px-3 py-2 text-sm">
+      <span className="text-slate-500">#{index + 1} · {new Date(segment.created_at).toLocaleTimeString()} · {(segment.size_bytes / 1024).toFixed(0)} KB</span>
+      <div className="flex gap-2">
+        <button onClick={() => data && onPlay(data.url)} disabled={!data}
+                className="text-xs px-2.5 py-1 rounded border hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-50">▶ Play</button>
+        {data && <a href={data.url} download className="text-xs px-2.5 py-1 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">Download</a>}
+        <button onClick={onDelete} className="text-xs px-2.5 py-1 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950">Delete</button>
+      </div>
+    </li>
+  );
+}
+
+function AudioPreview({ url, onClose }: { url: string; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center p-4" onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} className="bg-white dark:bg-slate-900 rounded-lg p-6 w-[min(28rem,95vw)] shadow-2xl">
+        <h3 className="font-medium mb-4">Play recording</h3>
+        <audio controls autoPlay src={url} className="w-full mb-4" />
+        <div className="flex justify-end gap-2">
+          <a href={url} download className="text-sm px-3 py-1.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">Download</a>
+          <button onClick={onClose} className="text-sm px-3 py-1.5 rounded bg-slate-100 dark:bg-slate-800 hover:bg-slate-200 dark:hover:bg-slate-700">Close</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -951,18 +1500,22 @@ function ActionGroup({ title, children }: { title: string; children: React.React
   );
 }
 
-function ActionBtn({ label, onClick }: { label: string; onClick: () => void }) {
+function ActionBtn({ label, onClick, disabled, title }: { label: string; onClick: () => void; disabled?: boolean; title?: string }) {
   return (
-    <button onClick={onClick} className="text-sm text-left px-3 py-1.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">{label}</button>
+    <button onClick={onClick} disabled={disabled} title={title}
+            className="text-sm text-left px-3 py-1.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed">
+      {label}
+    </button>
   );
 }
 
-function ResetPasswordBtn({ onSubmit }: { onSubmit: (pw: string) => void }) {
+function ResetPasswordBtn({ onSubmit, disabled, title }: { onSubmit: (pw: string) => void; disabled?: boolean; title?: string }) {
   const [open, setOpen] = useState(false);
   const [pw, setPw] = useState('');
   return (
     <>
-      <button onClick={() => setOpen(true)} className="text-sm text-left px-3 py-1.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800">
+      <button onClick={() => setOpen(true)} disabled={disabled} title={title}
+              className="text-sm text-left px-3 py-1.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed">
         Reset password…
       </button>
       {open && (
@@ -988,11 +1541,47 @@ function ResetPasswordBtn({ onSubmit }: { onSubmit: (pw: string) => void }) {
   );
 }
 
-function WipeBtn({ onConfirm }: { onConfirm: () => void }) {
+// SendMessageBtn opens a small composer and fires SHOW_MESSAGE. Reused shape
+// (title + body) is what the group broadcaster uses too.
+function SendMessageBtn({ onSend, disabled, title }: { onSend: (title: string, message: string) => void; disabled?: boolean; title?: string }) {
+  const [open, setOpen] = useState(false);
+  const [t, setT] = useState('Message from IT');
+  const [m, setM] = useState('');
+  return (
+    <>
+      <button onClick={() => setOpen(true)} disabled={disabled} title={title}
+              className="text-sm text-left px-3 py-1.5 rounded border hover:bg-slate-50 dark:hover:bg-slate-800 disabled:opacity-40 disabled:cursor-not-allowed">
+        Send message…
+      </button>
+      {open && (
+        <div className="fixed inset-0 bg-black/40 z-50 flex items-center justify-center" onClick={() => setOpen(false)}>
+          <div onClick={e => e.stopPropagation()}
+               className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-lg p-5 w-[440px] space-y-3 shadow-xl">
+            <div className="font-medium">Send a message to this device</div>
+            <input value={t} onChange={e => setT(e.target.value)} placeholder="Title"
+                   className="block w-full rounded border bg-transparent px-3 py-2 text-sm" />
+            <textarea value={m} onChange={e => setM(e.target.value)} placeholder="Message…" rows={4}
+                      className="block w-full rounded border bg-transparent px-3 py-2 text-sm" />
+            <p className="text-xs text-slate-500">Pops up on the device screen as a dialog and a notification.</p>
+            <div className="flex justify-end gap-2">
+              <button onClick={() => setOpen(false)} className="text-sm px-3 py-1.5">Cancel</button>
+              <button disabled={!m.trim()}
+                      onClick={() => { onSend(t.trim() || 'Message', m.trim()); setOpen(false); setM(''); }}
+                      className="text-sm px-3 py-1.5 rounded bg-brand-600 hover:bg-brand-700 text-white disabled:opacity-40">Send</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function WipeBtn({ onConfirm, disabled, title }: { onConfirm: () => void; disabled?: boolean; title?: string }) {
   return (
     <button
       onClick={() => { const t = prompt('Type WIPE to factory-reset this device:'); if (t === 'WIPE') onConfirm(); }}
-      className="text-sm text-left px-3 py-1.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950">
+      disabled={disabled} title={title}
+      className="text-sm text-left px-3 py-1.5 rounded border border-rose-300 text-rose-600 hover:bg-rose-50 dark:hover:bg-rose-950 disabled:opacity-40 disabled:cursor-not-allowed">
       Factory wipe…
     </button>
   );
@@ -1080,21 +1669,34 @@ function StateBadge({ state }: { state: string }) {
   return <span className={`inline-block px-2 py-0.5 rounded text-[11px] uppercase tracking-wide ${map[state] ?? ''}`}>{state}</span>;
 }
 
-function DeviceInfoCard({ info }: { info: Record<string, unknown> | null }) {
-  if (!info) return null;
+function DeviceInfoCard({ device, info }: { device: Device; info: Record<string, unknown> | null }) {
+  // Prefer live values from the 60s heartbeat (kept fresh on the server row,
+  // re-fetched by the parent every 5s) and fall back to the FETCH_DEVICE_INFO
+  // snapshot for fields not in the heartbeat. Without this overlay, battery /
+  // ip / wifi ssid would display whatever they were at the moment the page
+  // first auto-fired FETCH_DEVICE_INFO and never change.
+  const battery = device.last_battery_pct ?? (info?.battery_pct as number | undefined);
+  const charging = device.last_charging ?? (info?.charging as boolean | undefined);
+  const network = device.last_network_type ?? (info?.network as string | undefined);
+  const ssid = device.last_wifi_ssid ?? (info?.wifi_ssid as string | undefined);
+  const ip = device.last_ip_address ?? (info?.ip_address as string | undefined);
+  const mac = device.last_mac_address ?? (info?.mac_address as string | undefined);
+  const storageFree = device.last_storage_free_bytes ?? (info?.storage_free_bytes as number | undefined);
+
+  if (!info && battery == null && network == null) return null;
   const rows: Array<[string, React.ReactNode]> = [
-    ['Manufacturer', info.manufacturer as string],
-    ['Model', info.model as string],
-    ['Android', `${info.android_version ?? '—'} (SDK ${info.sdk ?? '?'})`],
-    ['Patch level', info.patch_level as string],
-    ['Storage', formatStorage(info.storage_free_bytes as number, info.storage_total_bytes as number)],
-    ['Battery', info.battery_pct != null ? `${info.battery_pct}%${info.charging ? ' (charging)' : ''}` : '—'],
-    ['Network', `${(info.network as string) ?? '—'}${info.wifi_ssid ? ` · ${info.wifi_ssid}` : ''}`],
-    ['IP address', info.ip_address ? <code className="text-xs">{info.ip_address as string}</code> : '—'],
-    ['MAC address', info.mac_address ? <code className="text-xs">{info.mac_address as string}</code> : '—'],
-    ['Agent', `${info.agent_version ?? '—'}${info.device_owner ? ' • Device Owner' : info.admin_active ? ' • Device Admin' : ''}`],
-    ['Integrity', renderFlags(info)],
-    ['Fetched', info.fetched_at ? new Date(info.fetched_at as string).toLocaleString() : '—']
+    ['Manufacturer', (info?.manufacturer as string) ?? device.manufacturer ?? '—'],
+    ['Model', (info?.model as string) ?? device.model ?? '—'],
+    ['Android', `${info?.android_version ?? device.os_version ?? '—'} (SDK ${info?.sdk ?? '?'})`],
+    ['Patch level', (info?.patch_level as string) ?? device.security_patch_level ?? '—'],
+    ['Storage', formatStorage(storageFree as number | undefined, info?.storage_total_bytes as number | undefined)],
+    ['Battery', battery != null ? `${battery}%${charging ? ' (charging)' : ''}` : '—'],
+    ['Network', `${network ?? '—'}${ssid ? ` · ${ssid}` : ''}`],
+    ['IP address', ip ? <code className="text-xs">{ip}</code> : '—'],
+    ['MAC address', mac ? <code className="text-xs">{mac}</code> : '—'],
+    ['Agent', `${info?.agent_version ?? '—'}${info?.device_owner ? ' • Device Owner' : info?.admin_active ? ' • Device Admin' : ''}`],
+    ['Integrity', info ? renderFlags(info) : '—'],
+    ['Last heartbeat', device.last_heartbeat_at ? formatRelative(device.last_heartbeat_at) : '—']
   ];
   return (
     <section className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-4">

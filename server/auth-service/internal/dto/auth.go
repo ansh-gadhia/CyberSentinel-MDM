@@ -12,10 +12,11 @@ type LoginResponse struct {
 	ExpiresIn    int    `json:"expires_in"`
 	TokenType    string `json:"token_type"`
 	User         struct {
-		ID       string `json:"id"`
-		Email    string `json:"email"`
-		Role     string `json:"role"`
-		TenantID string `json:"tenant_id"`
+		ID          string   `json:"id"`
+		Email       string   `json:"email"`
+		Role        string   `json:"role"`
+		TenantID    string   `json:"tenant_id"`
+		Permissions []string `json:"permissions"`
 	} `json:"user"`
 }
 
@@ -31,8 +32,35 @@ type RefreshResponse struct {
 }
 
 type MeResponse struct {
-	ID       string `json:"id"`
+	ID          string   `json:"id"`
+	Email       string   `json:"email"`
+	Role        string   `json:"role"`
+	TenantID    string   `json:"tenant_id"`
+	Permissions []string `json:"permissions,omitempty"`
+}
+
+type CreateUserRequest struct {
 	Email    string `json:"email"`
+	Password string `json:"password"`
 	Role     string `json:"role"`
-	TenantID string `json:"tenant_id"`
+}
+
+type UpdateRoleRequest struct {
+	Role string `json:"role"`
+}
+
+// RolesResponse describes the full RBAC matrix for the admin UI's Roles page.
+type RolesResponse struct {
+	Roles       []string            `json:"roles"`
+	Permissions []string            `json:"permissions"`        // all known permissions
+	Matrix      map[string][]string `json:"matrix"`             // role → granted permissions
+}
+
+type ChangePasswordRequest struct {
+	OldPassword string `json:"old_password"`
+	NewPassword string `json:"new_password"`
+}
+
+type UpdateProfileRequest struct {
+	Email *string `json:"email,omitempty"`
 }

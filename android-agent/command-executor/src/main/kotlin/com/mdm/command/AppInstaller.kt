@@ -49,24 +49,27 @@ class AppInstaller @Inject constructor(
         downloadObjectId: String?,
         directUrl: String?
     ) {
-        val url = directUrl ?: downloadObjectId?.let { resolveObjectUrl(it) }
-        require(url != null) { "no download url provided" }
+        val initialUrl = directUrl ?: downloadObjectId?.let { resolveObjectUrl(it) }
+        requireNotNull(initialUrl) { "no download url provided" }
+
+        // Open the response stream first (with one transparent re-presign
+        // retry on stale-URL/transient failures), then open the
+        // PackageInstaller session and stream straight through — avoids
+        // holding a multi-hundred-MB APK in heap memory.
+        val body = openDownload(initialUrl, downloadObjectId)
+        val expectedBytes = body.contentLength()
 
         val pi = context.packageManager.packageInstaller
         val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
-            // Only pin the session to a specific package name when the admin
-            // supplied one. Empty/garbage values cause PackageInstaller to
-            // reject the commit. When omitted the installer derives the real
-            // package id from the APK's manifest at commit time.
             if (!packageName.isNullOrBlank() && packageName.contains('.')) {
                 setAppPackageName(packageName)
             }
+            if (expectedBytes > 0) setSize(expectedBytes)
         }
         val sessionId = pi.createSession(params)
         val session = pi.openSession(sessionId)
         val streamed = try {
-            session.openWrite("apk", 0, -1).use { out ->
-                val body = api.downloadRaw(url).body() ?: throw IOException("empty body for $url")
+            session.openWrite("apk", 0, if (expectedBytes > 0) expectedBytes else -1).use { out ->
                 var total = 0L
                 body.byteStream().use { input ->
                     val buf = ByteArray(64 * 1024); var n: Int
@@ -188,6 +191,36 @@ class AppInstaller @Inject constructor(
         val resp = api.presignDownload(objectId)
         check(resp.isSuccessful) { "presign ${resp.code()} for $objectId" }
         return resp.body()?.url ?: error("empty presign for $objectId")
+    }
+
+    /**
+     * Opens the APK byte stream behind [initialUrl]. Tries once; if MinIO
+     * responds with a retryable status (403 — usually a stale signature; 408
+     * timeout; 5xx server error) and we have an [objectId] we can re-presign
+     * against, it transparently mints a fresh URL and tries one more time. On
+     * final failure the IOException message carries the real HTTP status and
+     * a snippet of MinIO's XML error body, so the recorded command result is
+     * actually diagnosable (vs the previous "empty body" carrying no signal).
+     */
+    private suspend fun openDownload(initialUrl: String, objectId: String?): okhttp3.ResponseBody {
+        var url = initialUrl
+        var retried = false
+        while (true) {
+            val resp = api.downloadRaw(url)
+            val b = resp.body()
+            if (resp.isSuccessful && b != null) return b
+            val code = resp.code()
+            val errSnippet = runCatching { resp.errorBody()?.string()?.take(512) }.getOrNull()
+            val msg = "download failed http=$code body=${errSnippet ?: "<empty>"} url=$url"
+            val retryable = code == 403 || code == 400 || code == 408 || code in 500..599
+            if (!retried && retryable && objectId != null) {
+                Timber.w("$msg — retrying with fresh presign")
+                url = resolveObjectUrl(objectId)
+                retried = true
+                continue
+            }
+            throw IOException(msg)
+        }
     }
 
     private companion object {

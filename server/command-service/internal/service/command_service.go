@@ -74,6 +74,40 @@ func (s *CommandService) Create(ctx context.Context, in CreateInput) (*models.Co
 	return cmd, nil
 }
 
+type BroadcastInput struct {
+	TenantID  uuid.UUID
+	CreatedBy uuid.UUID
+	GroupID   uuid.UUID
+	Kind      string
+	Payload   json.RawMessage
+}
+
+// Broadcast fans a command out to every live device in a group, creating one
+// command per device (reusing Create, so each is validated + audited).
+func (s *CommandService) Broadcast(ctx context.Context, in BroadcastInput) (int, error) {
+	if _, ok := types.Valid[types.Kind(in.Kind)]; !ok {
+		return 0, apperr.New(apperr.CodeInvalidInput, "unknown command kind")
+	}
+	ids, err := s.repo.DeviceIDsInGroup(ctx, in.TenantID, in.GroupID)
+	if err != nil {
+		return 0, apperr.Wrap(apperr.CodeInternal, "group devices", err)
+	}
+	n := 0
+	for _, did := range ids {
+		if _, err := s.Create(ctx, CreateInput{
+			TenantID:  in.TenantID,
+			CreatedBy: in.CreatedBy,
+			DeviceID:  did,
+			Kind:      in.Kind,
+			Payload:   in.Payload,
+		}); err != nil {
+			return n, err
+		}
+		n++
+	}
+	return n, nil
+}
+
 func (s *CommandService) Get(ctx context.Context, tenantID, id uuid.UUID) (*models.Command, error) {
 	c, err := s.repo.Get(ctx, tenantID, id)
 	if err != nil {

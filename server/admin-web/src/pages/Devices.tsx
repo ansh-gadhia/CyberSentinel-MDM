@@ -3,6 +3,8 @@ import { Link } from 'react-router-dom';
 import { listDevices } from '../api/devices';
 import { useState } from 'react';
 import { formatRelative, isOnline } from '../components/online';
+import { ModeBadge } from '../components/DeviceMode';
+import { listGroups } from '../api/groups';
 
 export function Devices() {
   const [q, setQ] = useState('');
@@ -12,13 +14,15 @@ export function Devices() {
     queryFn: () => listDevices({ q, state, limit: 100 }),
     refetchInterval: 5000
   });
+  const { data: groups } = useQuery({ queryKey: ['groups'], queryFn: listGroups, staleTime: 30000 });
+  const groupName = new Map((groups ?? []).map(g => [g.id, g.name]));
 
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between gap-2">
         <h1 className="text-2xl font-semibold">Devices</h1>
         <div className="flex gap-2">
-          <input value={q} onChange={e => setQ(e.target.value)} placeholder="search serial/model/imei…"
+          <input value={q} onChange={e => setQ(e.target.value)} placeholder="search alias/serial/model/imei…"
                  className="rounded border px-3 py-2 bg-transparent text-sm" />
           <select value={state} onChange={e => setState(e.target.value)}
                   className="rounded border px-3 py-2 bg-transparent text-sm">
@@ -33,18 +37,19 @@ export function Devices() {
           <thead className="bg-slate-50 dark:bg-slate-800 text-left text-slate-500">
             <tr>
               <th className="px-4 py-2 font-normal">Connection</th>
-              <th className="px-4 py-2 font-normal">Serial</th>
+              <th className="px-4 py-2 font-normal">Device</th>
               <th className="px-4 py-2 font-normal">Model</th>
               <th className="px-4 py-2 font-normal">OS</th>
               <th className="px-4 py-2 font-normal">State</th>
+              <th className="px-4 py-2 font-normal">Mode</th>
               <th className="px-4 py-2 font-normal">Policy</th>
               <th className="px-4 py-2 font-normal">Last seen</th>
             </tr>
           </thead>
           <tbody>
-            {isLoading && <tr><td colSpan={7} className="px-4 py-6 text-center text-slate-400">loading…</td></tr>}
+            {isLoading && <tr><td colSpan={8} className="px-4 py-6 text-center text-slate-400">loading…</td></tr>}
             {!isLoading && data?.items?.length === 0 && (
-              <tr><td colSpan={7} className="px-4 py-8 text-center text-slate-400">No devices enrolled yet. Generate a token on the Enrollment page.</td></tr>
+              <tr><td colSpan={8} className="px-4 py-8 text-center text-slate-400">No devices enrolled yet. Generate a token on the Enrollment page.</td></tr>
             )}
             {data?.items.map(d => {
               const online = isOnline(d.last_heartbeat_at);
@@ -59,14 +64,23 @@ export function Devices() {
                       {online ? 'Connected' : 'Offline'}
                     </span>
                   </td>
-                  <td className="px-4 py-2 font-mono">
-                    <Link to={`/devices/${d.id}`} className="text-brand-600 hover:underline">
-                      {d.serial_number ?? d.id.slice(0, 8)}
+                  <td className="px-4 py-2">
+                    <Link to={`/devices/${d.id}`} className="text-brand-600 hover:underline font-medium">
+                      {d.alias?.trim() || d.serial_number || d.id.slice(0, 8)}
                     </Link>
+                    {d.alias?.trim() && (
+                      <div className="text-[11px] text-slate-400 font-mono">{d.serial_number ?? d.id.slice(0, 8)}</div>
+                    )}
+                    {d.group_id && groupName.has(d.group_id) && (
+                      <div className="mt-0.5 inline-block text-[10px] px-1.5 py-0.5 rounded bg-sky-100 text-sky-700 dark:bg-sky-950 dark:text-sky-300">
+                        {groupName.get(d.group_id)}
+                      </div>
+                    )}
                   </td>
                   <td className="px-4 py-2">{d.manufacturer ?? ''} {d.model ?? ''}</td>
                   <td className="px-4 py-2">{d.os_version ?? '—'}</td>
                   <td className="px-4 py-2"><StateBadge state={d.state} /></td>
+                  <td className="px-4 py-2"><ModeBadge mode={d.last_mgmt_mode} /></td>
                   <td className="px-4 py-2 text-xs text-slate-500">v{d.applied_policy_version}</td>
                   <td className="px-4 py-2 text-xs text-slate-500" title={d.last_heartbeat_at}>{formatRelative(d.last_heartbeat_at)}</td>
                 </tr>

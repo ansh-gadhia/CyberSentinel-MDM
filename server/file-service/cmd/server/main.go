@@ -16,6 +16,7 @@ import (
 	"github.com/mdm/file-service/internal/repository"
 	"github.com/mdm/file-service/internal/storage"
 	"github.com/mdm/shared/auth"
+	"github.com/mdm/shared/authz"
 	"github.com/mdm/shared/config"
 	"github.com/mdm/shared/db"
 	"github.com/mdm/shared/logger"
@@ -58,11 +59,13 @@ func main() {
 	app.Get("/healthz", func(c *fiber.Ctx) error { return c.SendString("ok") })
 
 	g := app.Group("/api/v1/files", middleware.JWTAuth(issuer), middleware.TenantScope())
-	g.Get("/", h.List)
-	g.Post("/upload", middleware.RequireRole("super_admin", "admin"), h.Upload)
+	g.Get("/", middleware.RequirePermission(authz.PermFileRead), h.List)
+	g.Post("/upload", middleware.RequirePermission(authz.PermFileWrite), h.Upload)
 	g.Post("/device-upload", middleware.RequireDevice(), h.DeviceUpload)
-	g.Get("/:id/url", h.Presign)
-	g.Delete("/:id", middleware.RequireRole("super_admin", "admin"), h.Delete)
+	g.Get("/audio/session/:sessionID/url", middleware.RequirePermission(authz.PermFileRead), h.SessionAudio)
+	g.Get("/:id/url", middleware.RequirePermission(authz.PermFileRead), h.Presign)
+	g.Delete("/audio/session/:sessionID", middleware.RequirePermission(authz.PermFileDelete), h.DeleteSession)
+	g.Delete("/:id", middleware.RequirePermission(authz.PermFileDelete), h.Delete)
 
 	go func() {
 		mux := http.NewServeMux()

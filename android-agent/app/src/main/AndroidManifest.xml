@@ -19,6 +19,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CAMERA"
                      tools:ignore="ManifestTypo" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE"
+                     tools:ignore="ManifestTypo" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" tools:ignore="QueryAllPackagesPermission" />
@@ -72,13 +75,14 @@
 
         <!--
             Foreground service that keeps the MQTT command channel alive.
-            Declares camera + location types so the service can host the
-            CAPTURE_PHOTO / GET_LOCATION commands while running.
+            Declares camera + location + microphone types so the service can
+            host the CAPTURE_PHOTO / GET_LOCATION / START_AUDIO_STREAM commands
+            while running.
         -->
         <service
             android:name="com.mdm.command.CommandService"
             android:exported="false"
-            android:foregroundServiceType="dataSync|camera|location" />
+            android:foregroundServiceType="dataSync|camera|location|microphone" />
 
         <!--
             Receives PackageInstaller session commit callbacks. In DA mode the

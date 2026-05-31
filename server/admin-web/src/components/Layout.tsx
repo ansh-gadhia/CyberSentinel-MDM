@@ -1,17 +1,21 @@
 import { Link, NavLink, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/authStore';
-import { Moon, Sun, LogOut, Smartphone, Shield, Box, FileText, Activity, QrCode } from 'lucide-react';
+import { Moon, Sun, LogOut, Smartphone, Shield, Box, FileText, Activity, QrCode, Users, KeyRound } from 'lucide-react';
 import clsx from 'clsx';
 import { useEffect } from 'react';
 import { ToastRoot } from './toast';
+import { can } from '../lib/rbac';
 
-const nav = [
-  { to: '/',            label: 'Overview',   Icon: Activity },
-  { to: '/devices',     label: 'Devices',    Icon: Smartphone },
-  { to: '/policies',    label: 'Policies',   Icon: Shield },
-  { to: '/apps',        label: 'Apps',       Icon: Box },
-  { to: '/enrollment',  label: 'Enrollment', Icon: QrCode },
-  { to: '/audit',       label: 'Audit',      Icon: FileText }
+type NavItem = { to: string; label: string; Icon: typeof Activity; section: 'fleet' | 'ops'; perm?: string };
+const nav: NavItem[] = [
+  { to: '/',            label: 'Overview',   Icon: Activity,   section: 'fleet' },
+  { to: '/devices',     label: 'Devices',    Icon: Smartphone, section: 'fleet' },
+  { to: '/groups',      label: 'Groups',     Icon: Users,      section: 'fleet' },
+  { to: '/policies',    label: 'Policies',   Icon: Shield,     section: 'fleet' },
+  { to: '/apps',        label: 'Apps',       Icon: Box,        section: 'fleet' },
+  { to: '/enrollment',  label: 'Enrollment', Icon: QrCode,     section: 'ops' },
+  { to: '/audit',       label: 'Audit',      Icon: FileText,   section: 'ops' },
+  { to: '/roles',       label: 'Access',     Icon: KeyRound,   section: 'ops', perm: 'role:read' }
 ];
 
 export function Layout({ children }: { children: React.ReactNode }) {
@@ -36,7 +40,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         </Link>
         <div className="text-[10px] uppercase tracking-wider text-slate-400 px-1 mb-1">Fleet</div>
         <nav className="space-y-0.5 mb-4">
-          {nav.slice(0, 4).map(({ to, label, Icon }) => (
+          {nav.filter(n => n.section === 'fleet' && (!n.perm || can(n.perm))).map(({ to, label, Icon }) => (
             <NavLink
               key={to}
               to={to}
@@ -56,7 +60,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
         </nav>
         <div className="text-[10px] uppercase tracking-wider text-slate-400 px-1 mb-1">Operations</div>
         <nav className="space-y-0.5 flex-1">
-          {nav.slice(4).map(({ to, label, Icon }) => (
+          {nav.filter(n => n.section === 'ops' && (!n.perm || can(n.perm))).map(({ to, label, Icon }) => (
             <NavLink
               key={to}
               to={to}
@@ -74,7 +78,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
           ))}
         </nav>
         <div className="border-t border-slate-200 dark:border-slate-800 pt-3 text-sm">
-          <div className="mb-1 truncate font-medium" title={user?.email}>{user?.email ?? 'signed in'}</div>
+          <Link to="/profile" className="block mb-1 truncate font-medium hover:text-brand-600" title="Edit profile">
+            {user?.email ?? 'signed in'}
+          </Link>
           <div className="text-xs text-slate-500 mb-3">{user?.role}</div>
           <div className="flex items-center gap-2">
             <button

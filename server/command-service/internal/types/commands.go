@@ -32,9 +32,12 @@ const (
 	KindAllowUninstall      Kind = "ALLOW_UNINSTALL"
 	KindClearAppData        Kind = "CLEAR_APP_DATA"
 	KindCapturePhoto        Kind = "CAPTURE_PHOTO"           // headless camera capture
+	KindStartAudioStream    Kind = "START_AUDIO_STREAM"      // begin segmented mic recording (near-live)
+	KindStopAudioStream     Kind = "STOP_AUDIO_STREAM"       // end an active mic recording session
 	KindSetFlashlight       Kind = "SET_FLASHLIGHT"          // torch on/off
 	KindPlaySound           Kind = "PLAY_SOUND"              // find-device buzzer
 	KindGetLocation         Kind = "GET_LOCATION"            // last-known + a single fix
+	KindShowMessage         Kind = "SHOW_MESSAGE"            // pop a message on the device screen
 )
 
 var Valid = map[Kind]struct{}{
@@ -45,5 +48,6 @@ var Valid = map[Kind]struct{}{
 	KindSetGlobalProxy: {}, KindInstallCertificate: {}, KindRemoveCertificate: {},
 	KindPushFile: {}, KindPullFile: {}, KindRunIntegrityCheck: {},
 	KindBlockUninstall: {}, KindAllowUninstall: {}, KindClearAppData: {},
-	KindCapturePhoto: {}, KindSetFlashlight: {}, KindPlaySound: {}, KindGetLocation: {},
+	KindCapturePhoto: {}, KindStartAudioStream: {}, KindStopAudioStream: {},
+	KindSetFlashlight: {}, KindPlaySound: {}, KindGetLocation: {}, KindShowMessage: {},
 }

@@ -1,6 +1,6 @@
 import { useQuery } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
-import { listDevices } from '../api/devices';
+import { listDevices, deviceLabel } from '../api/devices';
 import { listPolicies } from '../api/policies';
 import { useEventStream } from '../hooks/useWebSocket';
 import { useState } from 'react';
@@ -27,6 +27,9 @@ export function Dashboard() {
   });
 
   const items = devices?.items ?? [];
+  // Resolve audit target_id → friendly device label (alias/serial) so the
+  // recent-events widget reads "… on Reception iPad" instead of a bare UUID.
+  const deviceName = new Map(items.map(d => [d.id, deviceLabel(d)]));
   const online = items.filter(d => isOnline(d.last_heartbeat_at)).length;
   const enrolled = items.filter(d => d.state === 'enrolled').length;
   const pending = items.filter(d => d.state === 'pending').length;
@@ -57,7 +60,10 @@ export function Dashboard() {
                 <li key={e.id} className="flex items-baseline gap-2 border-b border-slate-100 dark:border-slate-800 py-1">
                   <span className="text-xs text-slate-500 w-20 shrink-0">{formatRelative(e.created_at)}</span>
                   <code className="text-xs">{e.action}</code>
-                  <span className="text-xs text-slate-500">{e.actor_kind}</span>
+                  {e.target_id && deviceName.has(e.target_id) && (
+                    <span className="text-xs font-medium truncate">{deviceName.get(e.target_id)}</span>
+                  )}
+                  <span className="text-xs text-slate-500 ml-auto shrink-0">{e.actor_kind}</span>
                 </li>
               ))}
             </ul>

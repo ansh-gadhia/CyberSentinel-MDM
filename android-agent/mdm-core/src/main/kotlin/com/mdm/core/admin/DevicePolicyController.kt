@@ -222,14 +222,52 @@ class DevicePolicyController @Inject constructor(
             "com.brave.browser",             // Brave
             "org.chromium.chrome"            // raw Chromium
         )
+        // Expand each user-supplied pattern into the canonical Chrome
+        // URLBlocklist forms so we maximize match coverage regardless of
+        // how the user wrote it. "youtube.com" alone matches only the
+        // bare host on some Chrome versions; the *://*.host/* form matches
+        // subdomains across all schemes uniformly.
+        val expanded = patterns.flatMap { p ->
+            val raw = p.trim()
+            if (raw.isEmpty()) emptyList()
+            else if (raw.startsWith("http://") || raw.startsWith("https://") || raw.contains("://"))
+                listOf(raw)
+            else if (raw.startsWith("*.")) {
+                val host = raw.removePrefix("*.")
+                listOf(raw, "*://$raw/*", host, "*://$host/*")
+            } else {
+                listOf(raw, "*.$raw", "*://$raw/*", "*://*.$raw/*")
+            }
+        }.distinct()
+        val arr = expanded.toTypedArray()
         val bundle = android.os.Bundle().apply {
-            putStringArray("URLBlocklist", patterns.toTypedArray())
+            // URLBlocklist is the current key (Chrome ≥86); URLBlacklist is
+            // the legacy name. Setting both makes the policy work across the
+            // historical range with one push.
+            putStringArray("URLBlocklist", arr)
+            putStringArray("URLBlacklist", arr)
         }
         for (pkg in targets) {
             if (!isPackageInstalled(pkg)) continue
             try {
                 dpm.setApplicationRestrictions(admin, pkg, bundle)
-                Timber.i("Pushed URLBlocklist (${patterns.size} patterns) to $pkg")
+                // setApplicationRestrictions normally fires
+                // ACTION_APPLICATION_RESTRICTIONS_CHANGED automatically, but
+                // some Chrome builds only pick up changes on next launch.
+                // Send the broadcast explicitly so already-running Chrome
+                // re-reads the bundle immediately.
+                try {
+                    val intent = android.content.Intent(
+                        android.content.Intent.ACTION_APPLICATION_RESTRICTIONS_CHANGED
+                    ).apply {
+                        setPackage(pkg)
+                        addFlags(android.content.Intent.FLAG_INCLUDE_STOPPED_PACKAGES)
+                    }
+                    context.sendBroadcast(intent)
+                } catch (bt: Throwable) {
+                    Timber.w(bt, "broadcast restrictions-changed failed for $pkg")
+                }
+                Timber.i("Pushed URLBlocklist (${expanded.size} expanded patterns from ${patterns.size}) to $pkg")
             } catch (t: Throwable) {
                 Timber.w(t, "setApplicationRestrictions failed for $pkg")
             }
@@ -293,6 +331,7 @@ class DevicePolicyController @Inject constructor(
         val pkg = context.packageName
         val perms = listOf(
             android.Manifest.permission.CAMERA,
+            android.Manifest.permission.RECORD_AUDIO,
             android.Manifest.permission.ACCESS_FINE_LOCATION,
             android.Manifest.permission.ACCESS_COARSE_LOCATION,
             android.Manifest.permission.POST_NOTIFICATIONS,
